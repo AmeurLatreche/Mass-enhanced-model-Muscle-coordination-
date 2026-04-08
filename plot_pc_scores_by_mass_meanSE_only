@@ -1,0 +1,144 @@
+function plot_pc_scores_by_mass_meanSE_only(pcaMatFile, pcList)
+% PLOT_PC_SCORES_BY_MASS_MEANSE_ONLY
+%   PC scores vs mass (pooled across all cadences):
+%     - outliers removed within each mass group
+%     - plot mean ± SE only
+%    
+%
+
+
+    % ------------------- Defaults ---------------------------------------
+    if nargin < 1 || isempty(pcaMatFile)
+        pcaMatFile = 'E:\Tashih\TDC Data\PCA_outputs.mat';
+    end
+    if nargin < 2 || isempty(pcList)
+        pcList = 1:12;
+    end
+    pcList = pcList(:).';
+
+    % ------------------- Load PCA outputs -------------------------------
+    if ~isfile(pcaMatFile)
+        error('PCA file not found: %s', pcaMatFile);
+    end
+
+    S = load(pcaMatFile, 'Score_all', 'Sample');
+    if ~isfield(S,'Score_all') || ~isfield(S,'Sample')
+        error('PCA file must contain Score_all and Sample.');
+    end
+
+    Score_all = S.Score_all;
+    Sample    = S.Sample;
+
+    if isa(Sample,'dataset')
+        Sample = dataset2table(Sample);
+    elseif isstruct(Sample)
+        Sample = struct2table(Sample);
+    end
+
+    if ~istable(Sample) || ~ismember('massNum', Sample.Properties.VariableNames)
+        error('Sample must contain a "massNum" column.');
+    end
+
+    massNum = double(Sample.massNum(:));
+
+    % ------------------- Mass order -------------------------------------
+    massLevels = unique(massNum(isfinite(massNum)));
+    massLevels = sort(massLevels(:).');
+    if numel(massLevels) < 2
+        error('Not enough distinct mass levels found in Sample.massNum.');
+    end
+
+    massLabels = arrayfun(@(x) sprintf('%g', x), massLevels, 'UniformOutput', false);
+
+    % ------------------- Keep valid rows --------------------------------
+    inMass = ismember(massNum, massLevels);
+    goodM  = isfinite(massNum);
+
+    pcMask = true(size(Score_all,1),1);
+    for j = 1:numel(pcList)
+        pcj = pcList(j);
+        if pcj > size(Score_all,2)
+            error('Requested PC%d but only %d PCs available in Score_all.', ...
+                  pcj, size(Score_all,2));
+        end
+        pcMask = pcMask & isfinite(Score_all(:,pcj));
+    end
+
+    keep = inMass & goodM & pcMask;
+    if ~any(keep)
+        error('No valid rows found for mass conditions in %s.', pcaMatFile);
+    end
+
+    massNum_keep = massNum(keep);
+    scoresKeep   = Score_all(keep, pcList);
+
+    % ------------------- Plot layout ------------------------------------
+    nPC   = numel(pcList);
+    nCols = min(3, nPC);
+    nRows = ceil(nPC / nCols);
+
+    fig = figure('Name','PC scores vs mass (mean ± SE only)','Color','w');
+    set(fig,'Units','centimeters','Position',[5 5 26 10]);
+
+    tl = tiledlayout(nRows, nCols, 'TileSpacing','compact', 'Padding','compact');
+    title(tl, 'PC scores by mass (mean \pm SE)', 'FontSize', 13);
+
+    baseFont = 11;
+
+    % ------------------- Plot each PC -----------------------------------
+    for i = 1:nPC
+        pcIdx = pcList(i);
+        y     = scoresKeep(:, i);
+
+        outFlag = false(size(y));
+        for c = 1:numel(massLevels)
+            idx = (massNum_keep == massLevels(c));
+            xi  = y(idx);
+            if numel(xi) >= 4
+                outFlag(idx) = isoutlier(xi, 'quartiles');
+            end
+        end
+
+        yC    = y(~outFlag);
+        mNumC = massNum_keep(~outFlag);
+
+        mu = nan(1, numel(massLevels));
+        se = nan(1, numel(massLevels));
+
+        for c = 1:numel(massLevels)
+            xi = yC(mNumC == massLevels(c));
+            if ~isempty(xi)
+                mu(c) = mean(xi, 'omitnan');
+                se(c) = std(xi, 0, 'omitnan') / sqrt(sum(isfinite(xi)));
+            end
+        end
+
+        nexttile;
+        hold on;
+
+        xPos = 1:numel(massLevels);
+
+        errorbar(xPos, mu, se, 'o-', ...
+            'LineWidth', 1.4, ...
+            'MarkerSize', 5, ...
+            'MarkerFaceColor', 'k', ...
+            'Color', 'k');
+
+        yline(0, 'k-', 'LineWidth', 1);
+
+        xlim([0.5, numel(massLevels)+0.5]);
+        ylim([-3 3]);
+        xticks(xPos);
+        xticklabels(massLabels);
+
+        grid on;
+        box off;
+        set(gca, 'FontSize', baseFont);
+
+        xlabel('Mass scaled condition');
+        ylabel(sprintf('PC%d score', pcIdx));
+        title(sprintf('PC%d by mass (mean \\pm SE)', pcIdx));
+
+        hold off;
+    end
+end
