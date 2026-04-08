@@ -1,0 +1,204 @@
+function plot_reconstructed_curves_from_xlsx(xlsxPath, musclesToPlot, isNormalized, curvesSheetFilter)
+% PLOT_RECONSTRUCTED_CURVES_FROM_XLSX
+%   Reads reconstructed activation curves for MASS CONDITIONS ONLY
+%   (0.01, 1, 25, 70, 125 scales) from an Excel file and plots overlays per muscle.
+%
+%   IMPORTANT: This version automatically ignores non-mass Curves_* sheets
+%   such as Curves_ca_80T12_..., Curves_ca_80T40_..., etc.
+%
+% Usage examples:
+%   plot_reconstructed_curves_from_xlsx( ...
+%       'C:\Ameur Results\Selected\PCA_Reconstructions_PC1toPC5.xlsx', ...
+%       {'soleus_r','vas_lat_r','rect_fem_r','med_gas_r'}, true);
+%
+%   % If your sheets include "PC1to25" and you want only those:
+%   plot_reconstructed_curves_from_xlsx( ...
+%       'C:\Ameur Results\Selected\PCA_Reconstructions_PC1toPC5.xlsx', ...
+%       {'soleus_r','vas_lat_r'}, true, 'PC1to25');
+
+    % ------------------- Inputs & defaults -----------------------------
+    if nargin < 1 || isempty(xlsxPath)
+        xlsxPath = 'E:\Tashih\TDC Data\PCA_Reconstructions_PC1toPC5.xlsx';
+    end
+
+    if nargin < 2 || isempty(musclesToPlot)
+        % musclesToPlot = { ...
+        %     'tib_ant_r','med_gas_r','lat_gas_r', ...
+        %     'soleus_r','vas_med_r','rect_fem_r', ...
+        %     'vas_lat_r','bifemlh_r','semiten_r','glut_max3_r'};
+        musclesToPlot = { ...
+            'flex_dig_r','flex_hal_r','ext_dig_r', ...
+            'ext_hal_r','per_long_r','per_tert_r'};
+    end
+
+    if nargin < 3 || isempty(isNormalized)
+        isNormalized = true;  % default: normalized run
+    end
+
+    % Optional: only load curves sheets containing this substring
+    % e.g., 'PC1to25' or 'PC1to5'. Leave '' to accept any.
+    if nargin < 4
+        curvesSheetFilter = '';
+    end
+
+    % Y-axis label & title suffix
+    if isNormalized
+        yLabelText  = 'Activation';
+        titleSuffix = '';
+    else
+        yLabelText  = 'Activation';
+        titleSuffix = ' (raw)';
+    end
+
+    % ------------------- Discover available Curves sheets ---------------
+    try
+        allSheets = sheetnames(xlsxPath);
+    catch ME
+        error('Cannot read sheet names from:\n  %s\nReason: %s', xlsxPath, ME.message);
+    end
+
+    % Only sheets starting with Curves_
+    curvesSheets = allSheets(startsWith(allSheets, 'Curves_', 'IgnoreCase', true));
+
+    % Optional substring filter (PC1to25, etc.)
+    if ~isempty(curvesSheetFilter)
+        curvesSheets = curvesSheets(contains(curvesSheets, curvesSheetFilter, 'IgnoreCase', true));
+    end
+
+    if isempty(curvesSheets)
+        error('No Curves_* sheets found in %s (filter="%s").', xlsxPath, curvesSheetFilter);
+    end
+
+    % ------------------- Keep MASS condition sheets ONLY ----------------
+    % Mass sheets look like: Curves_0.01kg_..., Curves_1kg_..., etc.
+    massVals = nan(size(curvesSheets));
+    for k = 1:numel(curvesSheets)
+        tok = regexp(curvesSheets{k}, 'Curves_([0-9.]+)', 'tokens', 'once');
+        if ~isempty(tok)
+            massVals(k) = str2double(tok{1});
+        end
+    end
+
+    isMassSheet  = ~isnan(massVals);
+    curvesSheets = curvesSheets(isMassSheet);
+    massVals     = massVals(isMassSheet);
+
+    if isempty(curvesSheets)
+        error('Curves_* sheets exist, but none match mass pattern Curves_<mass>_* in:\n  %s', xlsxPath);
+    end
+
+    % Sort by increasing mass
+    [massVals, idx] = sort(massVals);
+    curvesSheets    = curvesSheets(idx);
+
+    % ------------------- Load the tables -------------------------------
+    T           = cell(0,1);
+    massLabels  = cell(0,1);
+    loadedSheets = cell(0,1);
+
+    for i = 1:numel(curvesSheets)
+        sName = curvesSheets{i};
+        try
+            Ti = readtable(xlsxPath, 'Sheet', sName);
+
+            % Accept cyclePct with case variations
+            vnames = Ti.Properties.VariableNames;
+            cycIdx = find(strcmpi(vnames, 'cyclePct'), 1);
+            if isempty(cycIdx)
+                warning('Sheet "%s" has no cyclePct column. Skipping.', sName);
+                continue;
+            end
+            Ti.Properties.VariableNames{cycIdx} = 'cyclePct';
+
+            T{end+1,1}           = Ti; %#ok<AGROW>
+            loadedSheets{end+1,1} = sName; %#ok<AGROW>
+            massLabels{end+1,1}  = sprintf('%g ', massVals(i)); %#ok<AGROW>
+
+        catch ME
+            warning('Failed to read sheet "%s": %s. Skipping.', sName, ME.message);
+        end
+    end
+
+    if isempty(T)
+        error('Mass-condition Curves_<mass>_* sheets were found, but none could be read from:\n  %s', xlsxPath);
+    end
+
+    fprintf('\n[Reconstruction] Loaded %d MASS conditions from:\n  %s\n', numel(T), xlsxPath);
+    disp('  Sheets loaded (mass only):');
+    disp(loadedSheets);
+
+    % ------------------- Time / cycle column ---------------------------
+    cyclePct = T{1}.cyclePct;
+
+    % ------------------- Academic-style figure -------------------------
+    nMuscles = numel(musclesToPlot);
+    nCols    = ceil(sqrt(nMuscles));
+    nRows    = ceil(nMuscles / nCols);
+
+    fig = figure('Name','Reconstructed activation curves (mass conditions only)', ...
+                 'Color','w');
+    set(fig, 'Units','centimeters', 'Position',[5 5 18 18]);
+
+    t = tiledlayout(nRows, nCols, 'TileSpacing','compact', 'Padding','compact');
+
+    % colour set for mass conditions
+    nMass = numel(T);
+    colorOrder = lines(nMass);
+
+    % representative lines for legend (one per mass)
+    repLines = gobjects(nMass,1);
+
+    for m = 1:nMuscles
+        mus = musclesToPlot{m};
+
+        % If not in first sheet, skip (avoid empty subplot warnings)
+        if ~ismember(mus, T{1}.Properties.VariableNames)
+            warning('Muscle "%s" not found in first loaded mass sheet. Skipping this muscle.', mus);
+            continue;
+        end
+
+        ax = nexttile;
+        hold(ax,'on');
+
+        for i = 1:nMass
+            if ~ismember(mus, T{i}.Properties.VariableNames)
+                warning('Muscle "%s" not found in sheet "%s". Skipping this sheet.', mus, loadedSheets{i});
+                continue;
+            end
+            y = T{i}.(mus);
+
+            h = plot(ax, cyclePct, y, 'LineWidth', 1.5, 'Color', colorOrder(i,:));
+
+            % For the FIRST muscle only, store a representative handle
+            if m == 1
+                repLines(i) = h;
+            end
+        end
+
+        % Axes style
+        grid(ax,'on');
+        xlim(ax,[0 100]);
+        if isNormalized
+            ylim(ax,[0 1]);    % normalized runs
+        end
+        set(ax, 'FontSize', 10, 'Box','off');
+
+        title(ax, strrep(mus,'_','\_'), 'Interpreter','tex');
+
+        if m > nMuscles - nCols
+            xlabel(ax,'Cycle (%)');
+        end
+        if mod(m-1, nCols) == 0
+            ylabel(ax, yLabelText);
+        end
+        hold(ax,'off');
+    end
+
+    % Single legend with ONE entry per mass
+    lgd = legend(repLines, massLabels, ...
+                 'Orientation','vertical', 'Location','eastoutside');
+    lgd.Title.String = 'Mass condition';
+
+    title(t, sprintf('Reconstructed activation curves%s (mass conditions only)', titleSuffix), ...
+          'FontWeight','bold', 'FontSize', 12);
+end
