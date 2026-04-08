@@ -1,0 +1,126 @@
+%% crop_Results_interval.m
+% Crop a Results struct to a selected time interval and save to new folder
+
+clear; clc;
+
+%% === USER SETTINGS ======================================================
+inDir   = 'C:\TDC Data\dimanche';   % folder of original files
+outDir  = 'c:\TDC Data';      % folder for cropped files
+fileName = 'Win3_sub03_0.01kgcadence140';          % WITHOUT ".mat"%%%%%%13 wala box plot kima hakik
+
+tStart = 10.16;   % start of desired interval
+tEnd   = 10.61;   % end of desired interval
+% ========================================================================
+
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+inFile  = fullfile(inDir,  [fileName '.mat']);
+outFile = fullfile(outDir, [fileName '.mat']);
+
+fprintf('Loading %s\n', inFile);
+S = load(inFile, 'Results');
+Results = S.Results;
+
+%% --- Build time indices (77-point grid and 76-point mid-grid) ----------
+tFull = Results.Time.genericMRS(:);        % 77 points, e.g. 0.55..1.31
+nT    = numel(tFull);
+
+% Logical indices for the requested interval on the 77-point grid
+idx77 = (tFull >= tStart) & (tFull <= tEnd);
+
+% Mid-time grid (length 76) for fields with 76 time samples
+tMid  = 0.5*(tFull(1:end-1) + tFull(2:end));
+idx76 = (tMid >= tStart) & (tMid <= tEnd);
+
+if ~any(idx77)
+    error('Chosen interval [%.3f %.3f] does not overlap the data range [%.3f %.3f].',...
+          tStart, tEnd, tFull(1), tFull(end));
+end
+
+%% --- Crop all fields that have Results.<field>.genericMRS ----------------
+fn = fieldnames(Results);
+for i = 1:numel(fn)
+    fname = fn{i};
+    val   = Results.(fname);
+
+    % Only touch fields that are structs with a "genericMRS" subfield
+    if ~(isstruct(val) && isfield(val, 'genericMRS'))
+        continue;
+    end
+
+    % Metabolic energy fields are handled later (after cropping Edot)
+    if strcmp(fname, 'MetabolicEnergy_perMus') || ...
+       strcmp(fname, 'MetabolicEnergy_total') || ...
+       strcmp(fname, 'MetabolicEnergy_totalkg')
+        continue;
+    end
+
+    arr = val.genericMRS;
+    sz  = size(arr);
+    nd  = ndims(arr);
+
+    % --- 1D vectors ---
+    if isvector(arr) && numel(arr) == nT
+        % same length as Time (77) → use idx77
+        val.genericMRS = arr(idx77);
+
+    elseif isvector(arr) && numel(arr) == (nT-1)
+        % length 76 → mid-grid fields
+        val.genericMRS = arr(idx76);
+
+    % --- 2D arrays: time is in 2nd dimension -----------------------------
+    elseif nd == 2 && sz(2) == nT
+        val.genericMRS = arr(:, idx77);
+
+    elseif nd == 2 && sz(2) == (nT-1)
+        val.genericMRS = arr(:, idx76);
+
+    % --- 3D arrays: time is in 2nd dimension -----------------------------
+    elseif nd >= 3 && sz(2) == nT
+        val.genericMRS = arr(:, idx77, :);
+
+    elseif nd >= 3 && sz(2) == (nT-1)
+        val.genericMRS = arr(:, idx76, :);
+
+    else
+        % Anything that does not match a time dimension is left unchanged
+        % fprintf('Leaving field %s unchanged (size %s)\n', ...
+        %        fname, mat2str(sz));
+    end
+
+    Results.(fname) = val;
+end
+
+%% --- Update Time and Time1D ---------------------------------------------
+Results.Time.genericMRS   = tFull(idx77);
+Results.Time1D.genericMRS = tFull(idx77);
+
+%% --- Recompute metabolic energy over the new interval -------------------
+if isfield(Results, 'MetabolicEdot') && isfield(Results.MetabolicEdot, 'genericMRS')
+    Edot_sub   = Results.MetabolicEdot.genericMRS;  % 43 × Nsub (should match tMid(idx76))
+    tMid_sub   = tMid(idx76);
+
+    if size(Edot_sub, 2) == numel(tMid_sub)
+        % Energy per muscle (J)
+        % trapz integrates along dimension 2 using tMid_sub as x
+        E_perMus = trapz(tMid_sub, Edot_sub, 2);      % 43×1
+
+        Results.MetabolicEnergy_perMus.genericMRS = E_perMus;
+        Results.MetabolicEnergy_total.genericMRS   = sum(E_perMus);
+
+        % Keep MetabolicEnergy_totalkg as in original (often NaN)
+        % You can add your own body mass division here if needed.
+    else
+        warning('MetabolicEdot size does not match tMid_sub; energy not recomputed.');
+    end
+end
+
+%% --- Save cropped struct -------------------------------------------------
+fprintf('Saving cropped file to %s\n', outFile);
+save(outFile, 'Results');
+
+fprintf('Done. New time range: [%.3f  %.3f] s (%d samples).\n', ...
+        Results.Time.genericMRS(1), Results.Time.genericMRS(end), ...
+        numel(Results.Time.genericMRS));
