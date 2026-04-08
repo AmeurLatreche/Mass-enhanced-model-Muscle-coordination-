@@ -1,0 +1,810 @@
+function [Results] = FormulateAndSolveMRS_1D(Misc, DatStore, Mesh, trial, SolverSetup, ...
+    Results, NMuscles, NFibres, IG, MuscProperties, PrefixOutFile)
+% -------------------------------------------------------------------------
+% FormulateAndSolveMRS_1D
+%
+% 1D mass-enhanced variant of MRS:
+%   - keeps KULeuven / De Groote FL/FV/tendon laws
+%   - keeps residual actuator philosophy for torque balance
+%   - adds 1D internal lumped muscle-mass dynamics
+%   - uses projected gravity along the muscle axis when direction data exist
+%   - prints unit diagnostics for a chosen muscle name
+%
+% UPDATED:
+%   - torque balance now uses FM_line (activation-dependent line-of-action
+%     muscle force), not FT
+%   - FT is still computed from tendon stretch law
+%   - soft equilibrium penalty is kept:
+%         J += wEq * ||FT - FM_line||^2
+%   - 1D lump chain still runs between FM_line and FT
+%
+% Internal 1D lump units:
+%   p : cm
+%   v : cm/s
+%   a : cm/s^2
+%   F : N
+%   m : kg
+% -------------------------------------------------------------------------
+
+%% 1) CasADi setup
+if isfield(Misc,'casadiPath')
+    addpath(genpath(Misc.casadiPath));
+end
+import casadi.*
+
+disp(['FormulateAndSolveMRS_1D: using KULeuven / De Groote FL/FV/tendon laws + ', ...
+      'MRS-style torque balance + 1D mass enhancement + projected gravity + ', ...
+      'FM_line-based torque balance + soft fiber-tendon equilibrium penalty.']);
+
+if ~isfield(Misc,'printUnitCheck') || isempty(Misc.printUnitCheck)
+    Misc.printUnitCheck = true;
+end
+
+if ~isfield(Misc,'wEq') || isempty(Misc.wEq)
+    Misc.wEq = 1e-4;
+end
+
+%% 2) Basic setup
+idxList   = Misc.idx_allMuscleList{trial};
+numMus    = numel(idxList);
+nSegments = 05;
+Nmesh     = Mesh(trial).N;
+h         = Mesh(trial).step;
+time_opt  = Mesh(trial).t;
+
+% Diagnostic muscle selection
+if isfield(DatStore(trial),'MuscleNames')
+    optMuscleNames = DatStore(trial).MuscleNames(idxList);
+else
+    optMuscleNames = arrayfun(@(i) sprintf('Muscle_%d', i), idxList, 'uni', false);
+end
+
+if ~isfield(Misc,'diagMuscleName') || isempty(Misc.diagMuscleName)
+    Misc.diagMuscleName = 'rect_fem_r';
+end
+
+diagMusLocal = find(strcmp(optMuscleNames, Misc.diagMuscleName), 1);
+if isempty(diagMusLocal)
+    warning('Diagnostic muscle "%s" not found in optimization list. Falling back to first muscle.', Misc.diagMuscleName);
+    diagMusLocal = 1;
+end
+
+% Gravity vector must be defined BEFORE any debug print that uses it
+if isfield(Misc,'gravityVector_m_s2') && numel(Misc.gravityVector_m_s2) == 3
+    g_vec_m_s2 = Misc.gravityVector_m_s2(:);
+else
+    g_vec_m_s2 = [0; -9.81; 0];
+end
+
+fprintf('Unit-check diagnostic muscle: local m=%d, global idx=%d, name=%s\n', ...
+    diagMusLocal, idxList(diagMusLocal), optMuscleNames{diagMusLocal});
+
+fprintf('DatStore(trial) has muscleUnitDir: %d\n', isfield(DatStore(trial), 'muscleUnitDir'));
+if isfield(DatStore(trial), 'muscleUnitDir')
+    t_dbg = squeeze(DatStore(trial).muscleUnitDir(1, idxList(diagMusLocal), :));
+    fprintf('Pre-loop direction for %s at k=1 = [%.6f %.6f %.6f]\n', ...
+        optMuscleNames{diagMusLocal}, t_dbg(1), t_dbg(2), t_dbg(3));
+    fprintf('Pre-loop g_proj for %s at k=1 = %.6f m/s^2\n', ...
+        optMuscleNames{diagMusLocal}, dot(g_vec_m_s2, t_dbg));
+end
+
+%% 2a) Muscle geometry & mass
+if isfield(Misc,'muscleMass')
+    muscleMass = Misc.muscleMass(idxList);
+elseif isfield(MuscProperties,'muscleMass')
+    muscleMass = MuscProperties.muscleMass(idxList);
+else
+    muscleMass = ones(numMus,1) * (Misc.mass_value * nSegments);
+end
+
+fallbackMass = Misc.mass_value * nSegments;
+bad = ~isfinite(muscleMass) | muscleMass <= 0;
+if any(bad)
+    warning('Replacing %d invalid muscleMass entries with fallback %.3g kg.', sum(bad), fallbackMass);
+    muscleMass(bad) = fallbackMass;
+end
+
+%% 2b) Contractile parameters & sanitize vMtildemax
+if isfield(Misc,'vMtildemax') && isstruct(Misc.vMtildemax)
+    S   = Misc.vMtildemax(:);
+    raw = zeros(numel(S),1);
+    for i = 1:numel(S)
+        fns = fieldnames(S(i));
+        for j = 1:numel(fns)
+            vtmp = S(i).(fns{j});
+            if isnumeric(vtmp) && isscalar(vtmp)
+                raw(i) = vtmp;
+                break
+            end
+        end
+    end
+    Misc.vMtildemax = raw;
+end
+
+nElem = numel(Misc.vMtildemax);
+if mod(nElem, NFibres) ~= 0
+    error('vMtildemax length must be multiple of NFibres');
+end
+
+nGlob      = nElem / NFibres;
+full_vM    = reshape(double(Misc.vMtildemax), NFibres, nGlob)';
+vMtildemax = full_vM(idxList,:);
+per_fibre  = Misc.per_fibre(idxList,:);
+kT_loc     = MuscProperties.kT(idxList);
+shift_loc  = MuscProperties.shift(idxList);
+
+%% 2c) Torque-balance data
+hasMA  = isfield(DatStore(trial),'MA');
+hasExp = isfield(DatStore(trial),'externalMoment');
+
+if ~isfield(DatStore(trial),'nDOF') || isempty(DatStore(trial).nDOF)
+    if hasExp
+        DatStore(trial).nDOF = size(DatStore(trial).externalMoment,2);
+    else
+        error('DatStore(trial).nDOF is missing and externalMoment is unavailable.');
+    end
+end
+nDOF = DatStore(trial).nDOF;
+
+if ~hasMA
+    warning('DatStore(trial).MA not found. Torque balance constraints will be skipped.');
+end
+if ~hasExp
+    warning('DatStore(trial).externalMoment not found. Torque balance constraints will be skipped.');
+end
+
+%% 3) Build CasADi Opti
+opti = Opti();
+
+%% 4) Decision variables
+a = opti.variable(numMus*NFibres, Nmesh+1);
+opti.subject_to(0 <= a <= 1);
+opti.set_initial(a, IG.a);
+
+lMtilde = opti.variable(numMus, Nmesh+1);
+opti.subject_to(0.1 <= lMtilde <= 1.7);
+opti.set_initial(lMtilde, IG.lMtilde);
+
+e = opti.variable(numMus*NFibres, Nmesh);
+opti.subject_to(0 <= e <= 1);
+opti.set_initial(e, IG.e);
+
+aT = opti.variable(nDOF, Nmesh+1);
+opti.subject_to(-1 <= aT <= 1);
+if isfield(IG,'aT') && ~isempty(IG.aT)
+    if size(IG.aT,2) == Nmesh
+        IG.aT = [IG.aT, IG.aT(:,end)];
+    end
+    opti.set_initial(aT, IG.aT);
+end
+
+vMtilde = opti.variable(numMus, Nmesh);
+opti.subject_to(-10 <= vMtilde <= 10);
+opti.set_initial(vMtilde, IG.vMtilde);
+
+lM_proj = opti.variable(numMus, Nmesh+1);
+opti.subject_to(lM_proj(:) >= 1e-4);
+opti.set_initial(lM_proj, IG.lM_projected);
+
+%% 5) 1D lump position & velocity states
+nTotalLumps = numMus * nSegments;
+maxLMT_cm   = max(DatStore(trial).LMTinterp(:)) * 100;  % m -> cm
+idxLump     = @(m,s) (m-1)*nSegments + s;
+
+p = opti.variable(nTotalLumps, Nmesh+1);     % cm
+opti.subject_to(0 <= p <= maxLMT_cm);
+
+v = opti.variable(nTotalLumps, Nmesh+1);     % cm/s
+opti.subject_to(-1e4 <= v <= 1e4);
+
+for m = 1:numMus
+    for s = 1:nSegments
+        i = idxLump(m,s);
+        opti.subject_to(p(i,1) == 0);
+        opti.set_initial(v(i,:), 0);
+    end
+end
+
+%% 6) Geometric constraint
+lMo    = MuscProperties.params(idxList,2);
+alpha0 = MuscProperties.params(idxList,4);
+w      = lMo .* sin(alpha0);
+
+opti.subject_to((lMtilde .* lMo).^2 - w.^2 == lM_proj.^2);
+
+%% 7) Activation ODE params
+tau_act   = reshape(ones(NFibres, numMus) .* Misc.tau_act',   [], 1);
+tau_deact = reshape(ones(NFibres, numMus) .* Misc.tau_deact', [], 1);
+
+%% 8) Objective + torque balance + lump dynamics
+J = 0;
+
+if ~isfield(Misc,'wDamp') || isempty(Misc.wDamp)
+    Misc.wDamp = 1e-2;
+end
+
+% unit diagnostics
+acc_force_cm_check = [];
+acc_grav_cm_check  = [];
+acc_net_cm_check   = [];
+dv_check           = [];
+force_diff_N_check = [];
+segM_check         = [];
+p_k_check          = [];
+v_k_check          = [];
+g_proj_m_s2_check  = [];
+FM_fiber_check     = [];
+FM_line_check      = [];
+FT_check           = [];
+cos_alpha_check    = [];
+eq_err_check       = [];
+
+for k = 1:Nmesh
+
+    % --- activation ODE
+    ak  = a(:,k);
+    ek  = e(:,k);
+    vMt = vMtilde(:,k);
+    aTk = aT(:,k);
+
+    Xk = [ak; lMtilde(:,k)];
+    Zk = [a(:,k+1); lMtilde(:,k+1)];
+    Uk = [ActivationDynamics(ek, ak, tau_act, tau_deact, Misc.b); vMt];
+
+    opti.subject_to(eulerIntegrator(Xk, Zk, Uk, h) == 0);
+
+    % --- muscle/tendon forces
+    FM_fiber = MX.zeros(numMus,1);   % fiber-axis muscle force
+    FM_line  = MX.zeros(numMus,1);   % line-of-action force = FM_fiber * cos(alpha)
+    FT       = MX.zeros(numMus,1);   % tendon force
+    COSA     = MX.zeros(numMus,1);   % cos(alpha)
+
+    for m = 1:numMus
+        i0 = (m-1)*NFibres + 1;
+        i1 = m*NFibres;
+
+        [Fm_fiber, Fm_line, Ft, ~, ~, cos_alpha_m, ~] = ComputeHillMuscleForceMassEnhanced( ...
+            ak(i0:i1)', ...
+            lMtilde(m,k), ...
+            vMtilde(m,k), ...
+            lM_proj(m,k), ...
+            DatStore(trial).LMTinterp(k,m), ...
+            MuscProperties.params(idxList(m),:), ...
+            kT_loc(m), ...
+            shift_loc(m), ...
+            vMtildemax(m,:), ...
+            per_fibre(m,:), ...
+            Misc.dampingCoefficient);
+
+        FM_fiber(m) = Fm_fiber;
+        FM_line(m)  = Fm_line;
+        FT(m)       = Ft;
+        COSA(m)     = cos_alpha_m;
+    end
+
+    % --- soft fiber-tendon equilibrium penalty
+    eqErr = FT - FM_line;
+    J = J + Misc.wEq * sumsqr(eqErr) / numMus;
+
+    % --- MRS-like torque balance
+    if hasMA && hasExp
+        % IMPORTANT UPDATE: use FM_line, not FT
+        tau_model = local_compute_tau_model(FM_line, DatStore(trial).MA, k, numMus, nDOF);
+
+        if isfield(Misc,'Topt') && ~isempty(Misc.Topt)
+            Topt_loc = Misc.Topt(:);
+            if numel(Topt_loc) == 1
+                Topt_loc = repmat(Topt_loc, nDOF, 1);
+            end
+            tau_res = aTk .* Topt_loc;
+        else
+            tau_res = aTk;
+        end
+
+        tau_exp = DatStore(trial).externalMoment(k,:)';
+        if numel(tau_exp) ~= nDOF
+            error('externalMoment has %d DOFs, but nDOF=%d.', numel(tau_exp), nDOF);
+        end
+
+        opti.subject_to(tau_model + tau_res == tau_exp);
+    end
+
+    % --- activation smoothing / damping cost
+    if k > 1
+        da = ak - a(:,k-1);
+        de = ek - e(:,k-1);
+        J  = J + Misc.wDamp * (sumsqr(da)/numMus + sumsqr(de)/numMus);
+    end
+
+    % --- metabolic & standard MRS-like costs
+    Edot = calcMinettiAlexander_multifibre( ...
+        reshape(ak,[NFibres,numMus])', ...
+        vMt, ...
+        Misc.params(1,idxList)', ...
+        vMtildemax, ...
+        per_fibre, ...
+        Misc.smeta, ...
+        NFibres);
+
+    J = J ...
+        + Misc.wAct  * 0.5 * (sumsqr(ek)/numMus + sumsqr(ak)/numMus) ...
+        + Misc.wTres * sumsqr(aTk)/nDOF ...
+        + Misc.wVm   * sumsqr(vMt)/numMus ...
+        + Misc.wEdot * (sum(Edot) * h)/numMus;
+
+    % --- 1D lump dynamics + projected gravity
+    for m = 1:numMus
+        segM = muscleMass(m) / nSegments;   % kg
+
+        Fint = MX.zeros(nSegments+1,1);
+        Fint(1)   = FM_line(m);   % N, muscle-side line force
+        Fint(end) = FT(m);        % N, tendon force
+
+        for s = 2:nSegments
+            Fint(s) = opti.variable();
+            opti.subject_to(-1e5 <= Fint(s) <= 1e5);
+        end
+
+        % projected gravity along muscle axis, in m/s^2
+        g_proj_m_s2 = local_getProjectedGravityAlongMuscle(DatStore, Misc, trial, k, m, g_vec_m_s2);
+
+        for s = 1:nSegments
+            i = idxLump(m,s);
+
+            % position update
+            opti.subject_to(p(i,k+1) == p(i,k) + h * v(i,k));
+
+            % force-induced acceleration
+            force_diff_N = Fint(s) - Fint(s+1);         % N
+            acc_force_cm = 100 * force_diff_N / segM;   % cm/s^2
+
+            % projected gravity acceleration
+            acc_grav_cm  = 100 * g_proj_m_s2;           % cm/s^2 (signed)
+            acc_net_cm   = acc_force_cm + acc_grav_cm;  % cm/s^2
+            dv           = acc_net_cm * h;              % cm/s
+
+            opti.subject_to(v(i,k+1) == v(i,k) + dv);
+
+            if m == diagMusLocal && s == 1 && k == 1
+                acc_force_cm_check = acc_force_cm;
+                acc_grav_cm_check  = acc_grav_cm;
+                acc_net_cm_check   = acc_net_cm;
+                dv_check           = dv;
+                force_diff_N_check = force_diff_N;
+                segM_check         = segM;
+                p_k_check          = p(i,k);
+                v_k_check          = v(i,k);
+                g_proj_m_s2_check  = g_proj_m_s2;
+
+                FM_fiber_check  = FM_fiber(m);
+                FM_line_check   = FM_line(m);
+                FT_check        = FT(m);
+                cos_alpha_check = COSA(m);
+                eq_err_check    = eqErr(m);
+            end
+        end
+    end
+
+    % --- small regularization on lump velocities
+    J = J + sumsqr(v(:,k)) / (numMus * nSegments);
+end
+
+opti.minimize(J / Nmesh);
+
+%% 9) Solver setup & solve
+SolverSetup.optionssol.ipopt.nlp_scaling_method = 'gradient-based';
+SolverSetup.optionssol.ipopt.mu_strategy        = 'adaptive';
+SolverSetup.optionssol.ipopt.print_level        = 5;
+SolverSetup.optionssol.ipopt.tol                = 1e-6;
+SolverSetup.optionssol.ipopt.acceptable_tol     = 1e-5;
+SolverSetup.optionssol.ipopt.acceptable_iter    = 10;
+SolverSetup.optionssol.ipopt.max_iter           = 10000;
+
+opti.solver(SolverSetup.nlp.solver, SolverSetup.optionssol);
+
+disp('Starting optimization...');
+diary(fullfile(Misc.OutPath, [Misc.OutName '_trial_' num2str(trial) '_' PrefixOutFile '_1D.txt']));
+tic
+try
+    sol = opti.solve();
+catch ME
+    warning('Solver failed: %s. Extracting last iterate.', ME.message);
+    sol = struct( ...
+        'a',        opti.debug.value(a), ...
+        'lMtilde',  opti.debug.value(lMtilde), ...
+        'e',        opti.debug.value(e), ...
+        'aT',       opti.debug.value(aT), ...
+        'vMtilde',  opti.debug.value(vMtilde), ...
+        'lM_proj',  opti.debug.value(lM_proj), ...
+        'p',        opti.debug.value(p), ...
+        'v',        opti.debug.value(v), ...
+        'acc_force_cm_check', opti.debug.value(acc_force_cm_check), ...
+        'acc_grav_cm_check',  opti.debug.value(acc_grav_cm_check), ...
+        'acc_net_cm_check',   opti.debug.value(acc_net_cm_check), ...
+        'dv_check',           opti.debug.value(dv_check), ...
+        'force_diff_N_check', opti.debug.value(force_diff_N_check), ...
+        'segM_check',         opti.debug.value(segM_check), ...
+        'p_k_check',          opti.debug.value(p_k_check), ...
+        'v_k_check',          opti.debug.value(v_k_check), ...
+        'g_proj_m_s2_check',  opti.debug.value(g_proj_m_s2_check), ...
+        'FM_fiber_check',     opti.debug.value(FM_fiber_check), ...
+        'FM_line_check',      opti.debug.value(FM_line_check), ...
+        'FT_check',           opti.debug.value(FT_check), ...
+        'cos_alpha_check',    opti.debug.value(cos_alpha_check), ...
+        'eq_err_check',       opti.debug.value(eq_err_check));
+end
+disp(['Solve time: ' num2str(toc) ' s']);
+diary off;
+
+%% 10) Extract results
+if ismethod(sol,'value')
+    tmpA   = sol.value(a);
+    tmplM  = sol.value(lMtilde);
+    tmpE   = sol.value(e);
+    tmpAT  = sol.value(aT);
+    tmpvM  = sol.value(vMtilde);
+    tmpP   = sol.value(p);
+    tmpV   = sol.value(v);
+
+    diag_acc_force_cm = sol.value(acc_force_cm_check);
+    diag_acc_grav_cm  = sol.value(acc_grav_cm_check);
+    diag_acc_net_cm   = sol.value(acc_net_cm_check);
+    diag_dv           = sol.value(dv_check);
+    diag_force_diff_N = sol.value(force_diff_N_check);
+    diag_segM         = sol.value(segM_check);
+    diag_p_k          = sol.value(p_k_check);
+    diag_v_k          = sol.value(v_k_check);
+    diag_g_proj_m_s2  = sol.value(g_proj_m_s2_check);
+
+    diag_FM_fiber     = sol.value(FM_fiber_check);
+    diag_FM_line      = sol.value(FM_line_check);
+    diag_FT           = sol.value(FT_check);
+    diag_cos_alpha    = sol.value(cos_alpha_check);
+    diag_eq_err       = sol.value(eq_err_check);
+else
+    tmpA   = sol.a;
+    tmplM  = sol.lMtilde;
+    tmpE   = sol.e;
+    tmpAT  = sol.aT;
+    tmpvM  = sol.vMtilde;
+    tmpP   = sol.p;
+    tmpV   = sol.v;
+
+    diag_acc_force_cm = sol.acc_force_cm_check;
+    diag_acc_grav_cm  = sol.acc_grav_cm_check;
+    diag_acc_net_cm   = sol.acc_net_cm_check;
+    diag_dv           = sol.dv_check;
+    diag_force_diff_N = sol.force_diff_N_check;
+    diag_segM         = sol.segM_check;
+    diag_p_k          = sol.p_k_check;
+    diag_v_k          = sol.v_k_check;
+    diag_g_proj_m_s2  = sol.g_proj_m_s2_check;
+
+    diag_FM_fiber     = sol.FM_fiber_check;
+    diag_FM_line      = sol.FM_line_check;
+    diag_FT           = sol.FT_check;
+    diag_cos_alpha    = sol.cos_alpha_check;
+    diag_eq_err       = sol.eq_err_check;
+end
+
+Results.Time1D(trial).(PrefixOutFile) = time_opt;
+Results.Time(trial).(PrefixOutFile)   = time_opt;
+
+Results.MActivation(trial).(PrefixOutFile) = tmpA;
+Results.lMtildeopt(trial).(PrefixOutFile)  = tmplM;
+Results.MExcitation(trial).(PrefixOutFile) = tmpE;
+Results.RActivation(trial).(PrefixOutFile) = tmpAT;
+Results.vMtilde(trial).(PrefixOutFile)     = tmpvM;
+Results.vMtilde_sep(trial).(PrefixOutFile) = tmpvM;
+
+pos3 = cat(3, tmpP, tmpP, tmpP);
+vel3 = cat(3, tmpV, tmpV, tmpV);
+
+Results.mass_positions(trial).(PrefixOutFile)  = pos3;
+Results.mass_velocities(trial).(PrefixOutFile) = vel3;
+Results.mass_pos_norm(trial).(PrefixOutFile)   = abs(tmpP);
+Results.mass_vel_norm(trial).(PrefixOutFile)   = abs(tmpV);
+
+Results.UnitCheck(trial).(PrefixOutFile).diagMuscleName       = optMuscleNames{diagMusLocal};
+Results.UnitCheck(trial).(PrefixOutFile).diagMuscleLocalIndex = diagMusLocal;
+Results.UnitCheck(trial).(PrefixOutFile).diagMuscleGlobalIdx  = idxList(diagMusLocal);
+Results.UnitCheck(trial).(PrefixOutFile).gravity_vector_m_s2  = g_vec_m_s2;
+Results.UnitCheck(trial).(PrefixOutFile).h_s                  = h;
+Results.UnitCheck(trial).(PrefixOutFile).segM_kg              = diag_segM;
+Results.UnitCheck(trial).(PrefixOutFile).force_diff_N         = diag_force_diff_N;
+Results.UnitCheck(trial).(PrefixOutFile).g_proj_m_s2          = diag_g_proj_m_s2;
+Results.UnitCheck(trial).(PrefixOutFile).acc_force_cm_s2      = diag_acc_force_cm;
+Results.UnitCheck(trial).(PrefixOutFile).acc_grav_cm_s2       = diag_acc_grav_cm;
+Results.UnitCheck(trial).(PrefixOutFile).acc_net_cm_s2        = diag_acc_net_cm;
+Results.UnitCheck(trial).(PrefixOutFile).dv_cm_s              = diag_dv;
+Results.UnitCheck(trial).(PrefixOutFile).p_k_cm               = diag_p_k;
+Results.UnitCheck(trial).(PrefixOutFile).v_k_cm_s             = diag_v_k;
+
+Results.UnitCheck(trial).(PrefixOutFile).FM_fiber_N           = diag_FM_fiber;
+Results.UnitCheck(trial).(PrefixOutFile).FM_line_N            = diag_FM_line;
+Results.UnitCheck(trial).(PrefixOutFile).FT_N                 = diag_FT;
+Results.UnitCheck(trial).(PrefixOutFile).cos_alpha            = diag_cos_alpha;
+Results.UnitCheck(trial).(PrefixOutFile).eq_error_N           = diag_eq_err;
+
+if Misc.printUnitCheck
+    fprintf('\n================ UNIT CONSISTENCY CHECK ================\n');
+    fprintf('Diagnostic muscle:\n');
+    fprintf('  local index  : %d\n', diagMusLocal);
+    fprintf('  global index : %d\n', idxList(diagMusLocal));
+    fprintf('  name         : %s\n', optMuscleNames{diagMusLocal});
+    fprintf('Internal lump units:\n');
+    fprintf('  p   : cm\n');
+    fprintf('  v   : cm/s\n');
+    fprintf('  g   : [%.3f %.3f %.3f] m/s^2\n', g_vec_m_s2(1), g_vec_m_s2(2), g_vec_m_s2(3));
+    fprintf('  h   : %.6g s\n', h);
+    fprintf('\nFirst stored diagnostic point (%s, s=1, k=1):\n', optMuscleNames{diagMusLocal});
+    fprintf('  segM         = %.6g kg\n', diag_segM);
+    fprintf('  p(k)         = %.6g cm\n', diag_p_k);
+    fprintf('  v(k)         = %.6g cm/s\n', diag_v_k);
+    fprintf('  FM_fiber     = %.6g N\n', diag_FM_fiber);
+    fprintf('  cos(alpha)   = %.6g\n', diag_cos_alpha);
+    fprintf('  FM_line      = %.6g N\n', diag_FM_line);
+    fprintf('  FT           = %.6g N\n', diag_FT);
+    fprintf('  FT-FM_line   = %.6g N\n', diag_eq_err);
+    fprintf('  force diff   = %.6g N\n', diag_force_diff_N);
+    fprintf('  g_proj       = %.6g m/s^2\n', diag_g_proj_m_s2);
+    fprintf('  acc_force    = %.6g cm/s^2\n', diag_acc_force_cm);
+    fprintf('  acc_grav     = %.6g cm/s^2\n', diag_acc_grav_cm);
+    fprintf('  acc_net      = %.6g cm/s^2\n', diag_acc_net_cm);
+    fprintf('  dv           = %.6g cm/s\n', diag_dv);
+    fprintf('=======================================================\n\n');
+end
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Subfunctions
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function tau_model = local_compute_tau_model(Fline, MAdata, k, numMus, nDOF)
+sz = size(MAdata);
+
+if ndims(MAdata) ~= 3
+    error('DatStore(trial).MA must be a 3D array.');
+end
+
+if sz(2) == numMus && sz(3) == nDOF
+    R = squeeze(MAdata(k,:,:));          % [numMus x nDOF]
+elseif sz(2) == nDOF && sz(3) == numMus
+    R = squeeze(MAdata(k,:,:)).';        % [numMus x nDOF]
+elseif sz(1) == numMus && sz(2) == nDOF
+    R = squeeze(MAdata(:,:,k));          % [numMus x nDOF]
+elseif sz(1) == nDOF && sz(2) == numMus
+    R = squeeze(MAdata(:,:,k)).';        % [numMus x nDOF]
+else
+    error('Unsupported MA dimensions: [%d %d %d].', sz(1), sz(2), sz(3));
+end
+
+tau_model = R.' * Fline;
+end
+
+function [FM_fiber, FM_line, FT, Fpe, FMltilde, cos_alpha, Fce_out] = ComputeHillMuscleForceMassEnhanced( ...
+    a, lMtilde, vMtilde, lM_projected, lMT, params, kT, shift, vMtildemax, per_fibre, d)
+import casadi.*
+
+FMo = params(1);
+lMo = params(2);
+lTs = params(3);
+
+lM = lMtilde * lMo;
+lT = lMT - lM_projected;
+lTtilde = lT / lTs;
+
+% tendon force from tendon strain
+fse = (exp(kT * (lTtilde - 0.995))) / 5 - 0.25 + shift;
+FT  = FMo * fse;
+
+% pennation projection
+cos_alpha = lM_projected / (lM + 1e-12);
+
+nFib = length(a);
+
+[Fpe, FMltilde] = local_getForceLengthProps(lMtilde);
+
+Fce_active = MX.zeros(nFib,1);
+Fce_damp   = MX.zeros(nFib,1);
+Fce_out    = MX.zeros(nFib,1);
+FMv_vec    = MX.zeros(nFib,1);
+
+sameVmax = max(abs(vMtildemax(:) - vMtildemax(1))) < 1e-12;
+
+if sameVmax
+    FMv_common = local_getForceVelocityProp(vMtilde, vMtildemax(1));
+    FMv_vec(:) = FMv_common;
+else
+    for i = 1:nFib
+        FMv_vec(i) = local_getForceVelocityProp(vMtilde, vMtildemax(i));
+    end
+end
+
+for i = 1:nFib
+    Fce_active(i) = a(i) * FMltilde * FMv_vec(i) * per_fibre(i);
+    Fce_damp(i)   = 0.1 * d * (vMtilde / (vMtildemax(i) + 1e-8)) * per_fibre(i);
+    Fce_out(i)    = Fce_active(i) + Fce_damp(i);
+end
+
+% total fiber-axis muscle force
+FM_fiber = FMo * (sum(Fce_out) + Fpe);
+
+% line-of-action force transmitted toward tendon
+FM_line = FM_fiber * cos_alpha;
+end
+
+function [Fpe, FMltilde] = local_getForceLengthProps(lMtilde)
+import casadi.*
+
+persistent printed_fl_once
+if isempty(printed_fl_once)
+    disp('Using KULeuven / De Groote 2016 active force-length curve.');
+    printed_fl_once = true;
+end
+
+Faparam = [0.814483478343008; ...
+           1.05503342897057; ...
+           0.162384573599574; ...
+           0.0633034484654646; ...
+           0.433004984392647; ...
+           0.716775413397760; ...
+          -0.0299471169706956; ...
+           0.200356847296188];
+
+b11 = Faparam(1); b21 = Faparam(2); b31 = Faparam(3); b41 = Faparam(4);
+b12 = Faparam(5); b22 = Faparam(6); b32 = Faparam(7); b42 = Faparam(8);
+
+b13 = 0.1;
+b23 = 1.0;
+b33 = 0.5 * sqrt(0.5);
+b43 = 0.0;
+
+e0  = 0.6;
+kpe = 4.0;
+
+t50 = exp(kpe * (0.2 - 1.0) / e0);
+pp1 = (t50 - 1.0);
+
+t7  = exp(kpe);
+pp2 = (t7 - 1.0);
+
+t5  = exp(kpe * (lMtilde - 1.0) / e0);
+Fpe = ((t5 - 1.0) - pp1) / pp2;
+
+num1 = lMtilde - b21;
+den1 = b31 + b41 * lMtilde;
+FMtilde1 = b11 * exp(-0.5 * num1.^2 ./ den1.^2);
+
+num2 = lMtilde - b22;
+den2 = b32 + b42 * lMtilde;
+FMtilde2 = b12 * exp(-0.5 * num2.^2 ./ den2.^2);
+
+num3 = lMtilde - b23;
+den3 = b33 + b43 * lMtilde;
+FMtilde3 = b13 * exp(-0.5 * num3.^2 ./ den3.^2);
+
+FMltilde = FMtilde1 + FMtilde2 + FMtilde3;
+end
+
+function FMvtilde = local_getForceVelocityProp(vMtilde, vMtildemax_i)
+import casadi.*
+
+persistent printed_fv_once
+if isempty(printed_fv_once)
+    disp('Using KULeuven / De Groote 2016 force-velocity curve.');
+    printed_fv_once = true;
+end
+
+ActiveFVParameters = [-0.215812499592629, ...
+                      -32.5966241739010, ...
+                      -1.12412150864786, ...
+                       0.912644059915004];
+
+e1 = 1.475 * ActiveFVParameters(1);
+e2 = 0.25  * ActiveFVParameters(2);
+e3 =        ActiveFVParameters(3) + 0.75;
+e4 =        ActiveFVParameters(4) - 0.027;
+
+arg = e2 * vMtilde ./ vMtildemax_i + e3;
+FMvtilde = e1 * log(arg + sqrt(arg.^2 + 1)) + e4;
+end
+
+function g_proj_m_s2 = local_getProjectedGravityAlongMuscle(DatStore, Misc, trial, k, m, g_vec_m_s2)
+persistent warned_once
+
+if isfield(DatStore(trial),'gravityProjectionCos')
+    C = DatStore(trial).gravityProjectionCos;
+    c = local_pick_scalar_2d(C, k, m);
+    g_proj_m_s2 = norm(g_vec_m_s2) * c;
+    return
+end
+
+if isfield(Misc,'gravityProjectionCos')
+    C = Misc.gravityProjectionCos;
+    c = local_pick_scalar_2d(C, k, m);
+    g_proj_m_s2 = norm(g_vec_m_s2) * c;
+    return
+end
+
+if isfield(DatStore(trial),'muscleUnitDir')
+    t_hat = local_pick_dir_3d(DatStore(trial).muscleUnitDir, k, m);
+    g_proj_m_s2 = dot(g_vec_m_s2, t_hat);
+    return
+end
+
+if isfield(DatStore(trial),'muscleDir')
+    t_hat = local_pick_dir_3d(DatStore(trial).muscleDir, k, m);
+    g_proj_m_s2 = dot(g_vec_m_s2, t_hat);
+    return
+end
+
+if isempty(warned_once)
+    warning(['No muscle direction / gravity projection data found. ', ...
+             'Projected gravity set to zero. ', ...
+             'Provide DatStore(trial).muscleUnitDir, DatStore(trial).muscleDir, ', ...
+             'DatStore(trial).gravityProjectionCos, or Misc.gravityProjectionCos ', ...
+             'for a true projected-gravity model.']);
+    warned_once = true;
+end
+g_proj_m_s2 = 0;
+end
+
+function c = local_pick_scalar_2d(A, k, m)
+sz = size(A);
+
+if isvector(A)
+    if numel(A) == 1
+        c = A(1);
+    elseif numel(A) >= m
+        c = A(m);
+    else
+        error('gravityProjectionCos vector is too short.');
+    end
+    return
+end
+
+if numel(sz) ~= 2
+    error('gravityProjectionCos must be 2D or scalar/vector.');
+end
+
+if sz(1) >= k && sz(2) >= m
+    c = A(k,m);
+elseif sz(1) >= m && sz(2) >= k
+    c = A(m,k);
+else
+    error('gravityProjectionCos has incompatible size.');
+end
+end
+
+function t_hat = local_pick_dir_3d(D, k, m)
+sz = size(D);
+
+if ndims(D) ~= 3
+    error('Direction array must be 3D.');
+end
+
+if sz(1) >= k && sz(2) >= m && sz(3) == 3
+    vec = squeeze(D(k,m,:));
+elseif sz(1) >= m && sz(2) == 3 && sz(3) >= k
+    vec = squeeze(D(m,:,k));
+elseif sz(1) == 3 && sz(2) >= m && sz(3) >= k
+    vec = squeeze(D(:,m,k));
+else
+    error('Unsupported direction array size [%d %d %d].', sz(1), sz(2), sz(3));
+end
+
+nv = norm(vec);
+if nv < 1e-12
+    t_hat = [0;0;0];
+else
+    t_hat = vec(:) / nv;
+end
+end
+
+function Ftilde = TendonForce_lMtilde(lTtilde)
+kT    = 35;
+shift = 0;
+Ftilde = (exp(kT .* (lTtilde - 0.995))) / 5 - 0.25 + shift;
+end
