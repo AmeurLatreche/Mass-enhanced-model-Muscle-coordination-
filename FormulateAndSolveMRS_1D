@@ -4,27 +4,7 @@ function [Results] = FormulateAndSolveMRS_1D(Misc, DatStore, Mesh, trial, Solver
 % FormulateAndSolveMRS_1D
 %
 % 1D mass-enhanced variant of MRS:
-%   - keeps KULeuven / De Groote FL/FV/tendon laws
-%   - keeps residual actuator philosophy for torque balance
-%   - adds 1D internal lumped muscle-mass dynamics
-%   - uses projected gravity along the muscle axis when direction data exist
-%   - prints unit diagnostics for a chosen muscle name
-%
-% UPDATED:
-%   - torque balance now uses FM_line (activation-dependent line-of-action
-%     muscle force), not FT
-%   - FT is still computed from tendon stretch law
-%   - soft equilibrium penalty is kept:
-%         J += wEq * ||FT - FM_line||^2
-%   - 1D lump chain still runs between FM_line and FT
-%
-% Internal 1D lump units:
-%   p : cm
-%   v : cm/s
-%   a : cm/s^2
-%   F : N
-%   m : kg
-% -------------------------------------------------------------------------
+%-------------------------------------------------
 
 %% 1) CasADi setup
 if isfield(Misc,'casadiPath')
