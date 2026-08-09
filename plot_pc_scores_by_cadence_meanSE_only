@@ -1,0 +1,873 @@
+function plot_pc_scores_by_cadence_meanSE_only(pcaMatFile, pcList)
+% PLOT_PC_SCORES_BY_CADENCE_MEANSE_ONLY
+%
+% PC scores versus cadence, pooled across all masses:
+%   - outliers removed within each cadence group
+%   - mean +/- SE only
+%   - 80T40 highlighted in orange
+%   - significance indicator added to each panel
+%   - BH-FDR-adjusted p-value added to each panel
+%   - partial eta squared and Cohen's f added to each panel
+%
+% Very small BH-FDR-adjusted p-values are displayed as:
+%   p_FDR < 0.001
+%
+% Statistical model:
+%   PC score ~ Cadence + Mass + (1|Participant)
+%
+% BH-FDR correction is performed across the first 25 PCs.
+%
+% Usage:
+%   plot_pc_scores_by_cadence_meanSE_only;
+%
+%   plot_pc_scores_by_cadence_meanSE_only( ...
+%       'E:\Tashih\TDC Data\PCA_outputs.mat', 1:5);
+
+    %% ------------------- Defaults --------------------------------------
+    if nargin < 1 || isempty(pcaMatFile)
+        pcaMatFile = 'E:\Tashih\TDC Data\PCA_outputs.mat';
+    end
+
+    if nargin < 2 || isempty(pcList)
+        pcList = 1:12;
+    end
+
+    pcList = unique(pcList(:).', 'stable');
+
+    % Number of PC tests included in the BH-FDR correction
+    requestedFDRTests = 25;
+
+    %% ------------------- Load PCA outputs ------------------------------
+    if ~isfile(pcaMatFile)
+        error('PCA file not found: %s', pcaMatFile);
+    end
+
+    S = load(pcaMatFile, 'Score_all', 'Sample');
+
+    if ~isfield(S, 'Score_all') || ~isfield(S, 'Sample')
+        error('PCA file must contain Score_all and Sample.');
+    end
+
+    Score_all = double(S.Score_all);
+    Sample    = S.Sample;
+
+    % Ensure Sample is a table
+    if isa(Sample, 'dataset')
+        Sample = dataset2table(Sample);
+
+    elseif isstruct(Sample)
+        Sample = struct2table(Sample);
+    end
+
+    if ~istable(Sample)
+        error('Sample must be a table, dataset, or structure.');
+    end
+
+    requiredVariables = {'cadence', 'massNum', 'subj'};
+
+    for k = 1:numel(requiredVariables)
+
+        if ~ismember( ...
+                requiredVariables{k}, ...
+                Sample.Properties.VariableNames)
+
+            error( ...
+                'Sample must contain a "%s" column.', ...
+                requiredVariables{k});
+        end
+    end
+
+    if size(Score_all, 1) ~= height(Sample)
+        error([ ...
+            'The number of rows in Score_all (%d) does not match ' ...
+            'the number of rows in Sample (%d).'], ...
+            size(Score_all, 1), ...
+            height(Sample));
+    end
+
+    nAvailablePCs = size(Score_all, 2);
+
+    if any(pcList < 1) || any(pcList > nAvailablePCs)
+        error('Score_all contains only %d PCs.', nAvailablePCs);
+    end
+
+    %% ------------------- Variables -------------------------------------
+    cadStr = string(Sample.cadence(:));
+
+    massNum = convert_to_numeric( ...
+        Sample.massNum, ...
+        'massNum');
+
+    subjectCat = convert_to_categorical( ...
+        Sample.subj);
+
+    %% ------------------- Cadence order ---------------------------------
+    cadOrder = ["80T40", "80T12", "120", "140"];
+
+    % Highlight settings for 80T40
+    highlightCad   = "80T40";
+    highlightColor = [0.85 0.33 0.10];
+    defaultColor   = [0 0 0];
+
+    %% ------------------- Valid observations ----------------------------
+    inCad = ismember(cadStr, cadOrder);
+
+    goodCad = ...
+        ~ismissing(cadStr) & ...
+        cadStr ~= "UNK" & ...
+        strlength(strtrim(cadStr)) > 0;
+
+    baseValid = ...
+        inCad & ...
+        goodCad & ...
+        isfinite(massNum) & ...
+        ~ismissing(subjectCat);
+
+    if ~any(baseValid)
+        error( ...
+            'No valid observations were found for the selected cadences.');
+    end
+
+    validSubjects = removecats(subjectCat(baseValid));
+
+    if numel(categories(validSubjects)) < 2
+        error('At least two participants are required.');
+    end
+
+    %% ------------------- Mass levels -----------------------------------
+    massLevels = unique(massNum(baseValid));
+    massLevels = sort(massLevels(:).');
+
+    if numel(massLevels) < 2
+        error('At least two mass conditions are required.');
+    end
+
+    massLabels = arrayfun( ...
+        @(x) sprintf('%g', x), ...
+        massLevels, ...
+        'UniformOutput', false);
+
+    %% ------------------- Statistical analysis --------------------------
+    nFDRTests = min(requestedFDRTests, nAvailablePCs);
+
+    if nAvailablePCs < requestedFDRTests
+        warning([ ...
+            'Only %d PCs are available. BH-FDR correction will be ' ...
+            'performed across %d tests instead of 25.'], ...
+            nAvailablePCs, ...
+            nFDRTests);
+    end
+
+    % Analyse the first 25 PCs and any additionally requested PCs
+    analysisPCs = unique( ...
+        [1:nFDRTests, pcList], ...
+        'stable');
+
+    pRaw       = nan(nAvailablePCs, 1);
+    pFDR       = nan(nAvailablePCs, 1);
+    etaPartial = nan(nAvailablePCs, 1);
+    cohenF     = nan(nAvailablePCs, 1);
+
+    for pcIdx = analysisPCs
+
+        y = Score_all(:, pcIdx);
+
+        % Remove outliers separately within each cadence group
+        keepPC = get_clean_pc_mask( ...
+            y, ...
+            cadStr, ...
+            cadOrder, ...
+            baseValid);
+
+        if sum(keepPC) < 5
+            warning( ...
+                'PC%d has too few valid observations.', ...
+                pcIdx);
+            continue;
+        end
+
+        try
+            cadenceCondition = categorical( ...
+                cellstr(cadStr(keepPC)), ...
+                cellstr(cadOrder), ...
+                cellstr(cadOrder), ...
+                'Ordinal', false);
+
+            massCondition = categorical( ...
+                massNum(keepPC), ...
+                massLevels, ...
+                massLabels, ...
+                'Ordinal', false);
+
+            T = table( ...
+                y(keepPC), ...
+                removecats(cadenceCondition), ...
+                removecats(massCondition), ...
+                removecats(subjectCat(keepPC)), ...
+                'VariableNames', { ...
+                    'Y', ...
+                    'Cadence', ...
+                    'Mass', ...
+                    'Subject'});
+
+            if numel(categories(T.Cadence)) < 2
+                error('Fewer than two cadence conditions remain.');
+            end
+
+            if numel(categories(T.Mass)) > 1
+
+                modelFormula = ...
+                    'Y ~ Cadence + Mass + (1|Subject)';
+
+            else
+
+                modelFormula = ...
+                    'Y ~ Cadence + (1|Subject)';
+            end
+
+            lme = fitlme( ...
+                T, ...
+                modelFormula, ...
+                'FitMethod', 'REML');
+
+            % Use Satterthwaite degrees of freedom when available
+            try
+                aovResult = anova( ...
+                    lme, ...
+                    'DFMethod', 'satterthwaite');
+
+            catch
+                aovResult = anova(lme);
+            end
+
+            % Compatible with table and legacy dataset outputs
+            [Fvalue, df1, df2, pValue] = ...
+                extract_cadence_statistics(aovResult);
+
+            pRaw(pcIdx) = pValue;
+
+            % Partial eta squared
+            etaValue = ...
+                (Fvalue * df1) / ...
+                ((Fvalue * df1) + df2);
+
+            etaValue = min(max(etaValue, 0), 1);
+
+            etaPartial(pcIdx) = etaValue;
+
+            % Cohen's f
+            if etaValue < 1
+
+                cohenF(pcIdx) = ...
+                    sqrt(etaValue / (1 - etaValue));
+
+            else
+
+                cohenF(pcIdx) = Inf;
+            end
+
+        catch ME
+
+            warning( ...
+                'Statistical analysis failed for PC%d:\n%s', ...
+                pcIdx, ...
+                ME.message);
+        end
+    end
+
+    %% ------------------- BH-FDR correction -----------------------------
+    pFDR(1:nFDRTests) = benjamini_hochberg( ...
+        pRaw(1:nFDRTests), ...
+        nFDRTests);
+
+    %% ------------------- Plot layout -----------------------------------
+    nPC   = numel(pcList);
+    nCols = min(3, nPC);
+    nRows = ceil(nPC / nCols);
+
+    fig = figure( ...
+        'Name', 'PC scores vs cadence (mean ± SE only)', ...
+        'Color', 'w');
+
+    figureHeight = max(10, 5 * nRows);
+
+    set( ...
+        fig, ...
+        'Units', 'centimeters', ...
+        'Position', [5 5 26 figureHeight]);
+
+    tl = tiledlayout( ...
+        nRows, ...
+        nCols, ...
+        'TileSpacing', 'compact', ...
+        'Padding', 'compact');
+
+    title( ...
+        tl, ...
+        'PC scores by cadence (mean \pm SE)', ...
+        'FontSize', 13);
+
+    baseFont = 11;
+
+    % X positions
+    xPos = 1:numel(cadOrder);
+
+    %% ------------------- Plot each PC ----------------------------------
+    for i = 1:nPC
+
+        pcIdx = pcList(i);
+        y     = Score_all(:, pcIdx);
+
+        % Remove outliers within each cadence group
+        keepPC = get_clean_pc_mask( ...
+            y, ...
+            cadStr, ...
+            cadOrder, ...
+            baseValid);
+
+        yClean   = y(keepPC);
+        cadClean = cadStr(keepPC);
+
+        % Mean and SE
+        mu = nan(1, numel(cadOrder));
+        se = nan(1, numel(cadOrder));
+
+        for c = 1:numel(cadOrder)
+
+            xi = yClean(cadClean == cadOrder(c));
+            xi = xi(isfinite(xi));
+
+            if ~isempty(xi)
+
+                mu(c) = mean(xi, 'omitnan');
+
+                if numel(xi) > 1
+
+                    se(c) = ...
+                        std(xi, 0, 'omitnan') / ...
+                        sqrt(numel(xi));
+
+                else
+
+                    se(c) = 0;
+                end
+            end
+        end
+
+        ax = nexttile;
+        hold(ax, 'on');
+
+        % Plot each cadence separately so 80T40 remains orange
+        for c = 1:numel(cadOrder)
+
+            if cadOrder(c) == highlightCad
+                thisColor = highlightColor;
+            else
+                thisColor = defaultColor;
+            end
+
+            errorbar( ...
+                ax, ...
+                xPos(c), ...
+                mu(c), ...
+                se(c), ...
+                'o', ...
+                'Color', thisColor, ...
+                'MarkerEdgeColor', thisColor, ...
+                'MarkerFaceColor', thisColor, ...
+                'LineWidth', 1.4, ...
+                'MarkerSize', 5, ...
+                'CapSize', 10);
+        end
+
+        % Connecting line through means
+        plot( ...
+            ax, ...
+            xPos, ...
+            mu, ...
+            '-', ...
+            'Color', defaultColor, ...
+            'LineWidth', 1.0);
+
+        % Re-draw highlighted point so it remains orange
+        cHi = find( ...
+            cadOrder == highlightCad, ...
+            1, ...
+            'first');
+
+        if ~isempty(cHi) && isfinite(mu(cHi))
+
+            errorbar( ...
+                ax, ...
+                xPos(cHi), ...
+                mu(cHi), ...
+                se(cHi), ...
+                'o', ...
+                'Color', highlightColor, ...
+                'MarkerEdgeColor', highlightColor, ...
+                'MarkerFaceColor', highlightColor, ...
+                'LineWidth', 1.6, ...
+                'MarkerSize', 6, ...
+                'CapSize', 10);
+        end
+
+        yline( ...
+            ax, ...
+            0, ...
+            'k-', ...
+            'LineWidth', 1);
+
+        xlim( ...
+            ax, ...
+            [0.5, numel(cadOrder) + 0.5]);
+
+        % Original limits retained
+        ylim(ax, [-5 9]);
+
+        xticks(ax, xPos);
+        xticklabels(ax, cellstr(cadOrder));
+
+        grid(ax, 'on');
+        box(ax, 'off');
+
+        set( ...
+            ax, ...
+            'FontSize', baseFont, ...
+            'Layer', 'top');
+
+        xlabel(ax, 'Cadence condition');
+        ylabel(ax, sprintf('PC%d score', pcIdx));
+
+        %% -------- Significance indicator -------------------------------
+        if pcIdx <= nFDRTests
+
+            sigText = significance_symbol( ...
+                pFDR(pcIdx));
+
+        else
+
+            sigText = 'NA';
+        end
+
+        title( ...
+            ax, ...
+            sprintf( ...
+                'PC%d by cadence (mean \\pm SE) %s', ...
+                pcIdx, ...
+                sigText));
+
+        %% -------- p-value and effect sizes -----------------------------
+        if pcIdx <= nFDRTests && isfinite(pFDR(pcIdx))
+
+            annotationText = sprintf([ ...
+                'p_{FDR} %s\n' ...
+                '\\eta_p^2 = %.3f; f = %.3f'], ...
+                format_pvalue(pFDR(pcIdx)), ...
+                etaPartial(pcIdx), ...
+                cohenF(pcIdx));
+
+        else
+
+            annotationText = ...
+                'Statistics unavailable';
+        end
+
+        text( ...
+            ax, ...
+            0.03, ...
+            0.96, ...
+            annotationText, ...
+            'Units', 'normalized', ...
+            'HorizontalAlignment', 'left', ...
+            'VerticalAlignment', 'top', ...
+            'FontSize', baseFont - 1, ...
+            'Interpreter', 'tex');
+
+        hold(ax, 'off');
+    end
+end
+
+
+%% =======================================================================
+function x = convert_to_numeric(xRaw, variableName)
+% CONVERT_TO_NUMERIC
+% Convert table variable to numeric.
+
+    if isnumeric(xRaw) || islogical(xRaw)
+
+        x = double(xRaw(:));
+
+    elseif iscategorical(xRaw) || ...
+           isstring(xRaw) || ...
+           ischar(xRaw) || ...
+           iscell(xRaw)
+
+        x = str2double(string(xRaw(:)));
+
+    else
+
+        error( ...
+            'Variable "%s" cannot be converted to numeric.', ...
+            variableName);
+    end
+
+    if ~any(isfinite(x))
+        error( ...
+            'Variable "%s" contains no finite values.', ...
+            variableName);
+    end
+end
+
+
+%% =======================================================================
+function xCat = convert_to_categorical(xRaw)
+% CONVERT_TO_CATEGORICAL
+% Convert table variable to categorical.
+
+    if iscategorical(xRaw)
+
+        xCat = xRaw(:);
+
+    elseif isnumeric(xRaw) || islogical(xRaw)
+
+        numericValues = double(xRaw(:));
+        textValues    = string(numericValues);
+
+        textValues(~isfinite(numericValues)) = missing;
+
+        xCat = categorical(textValues);
+
+    else
+
+        textValues = string(xRaw(:));
+
+        emptyMask = ...
+            ismissing(textValues) | ...
+            strlength(strtrim(textValues)) == 0;
+
+        textValues(emptyMask) = missing;
+
+        xCat = categorical(textValues);
+    end
+end
+
+
+%% =======================================================================
+function keepMask = get_clean_pc_mask( ...
+    y, cadStr, cadOrder, baseValid)
+% GET_CLEAN_PC_MASK
+% Remove outliers independently within each cadence condition.
+
+    y = double(y(:));
+
+    outFlag = false(size(y));
+
+    for c = 1:numel(cadOrder)
+
+        idx = ...
+            baseValid & ...
+            isfinite(y) & ...
+            cadStr == cadOrder(c);
+
+        rowNumbers = find(idx);
+        xi = y(idx);
+
+        if numel(xi) >= 4
+
+            groupOutliers = isoutlier( ...
+                xi, ...
+                'quartiles');
+
+            outFlag(rowNumbers(groupOutliers)) = true;
+        end
+    end
+
+    keepMask = ...
+        baseValid & ...
+        isfinite(y) & ...
+        ~outFlag;
+end
+
+
+%% =======================================================================
+function [Fvalue, df1, df2, pValue] = ...
+    extract_cadence_statistics(aovResult)
+% EXTRACT_CADENCE_STATISTICS
+% Extract omnibus cadence statistics from anova(lme).
+%
+% Supports:
+%   - modern table output
+%   - legacy dataset output
+
+    %% ---------------- Column and row names -----------------------------
+    if istable(aovResult)
+
+        variableNames = ...
+            aovResult.Properties.VariableNames;
+
+        rowNames = ...
+            aovResult.Properties.RowNames;
+
+    elseif isa(aovResult, 'dataset')
+
+        variableNames = ...
+            aovResult.Properties.VarNames;
+
+        rowNames = ...
+            aovResult.Properties.ObsNames;
+
+    else
+
+        error( ...
+            'Unsupported ANOVA output type: %s.', ...
+            class(aovResult));
+    end
+
+    variableNames = cellstr(variableNames);
+
+    %% ---------------- Find model terms ---------------------------------
+    termColumn = find_column_name( ...
+        variableNames, ...
+        {'Term'});
+
+    if ~isempty(termColumn)
+
+        terms = string(aovResult.(termColumn));
+
+    elseif ~isempty(rowNames)
+
+        terms = string(rowNames);
+
+    else
+
+        error( ...
+            'ANOVA output does not contain model-term names.');
+    end
+
+    terms = strtrim(terms(:));
+
+    cadenceRow = find( ...
+        strcmpi(terms, 'Cadence'), ...
+        1);
+
+    if isempty(cadenceRow)
+
+        cadenceRow = find( ...
+            contains(lower(terms), 'cadence'), ...
+            1);
+    end
+
+    if isempty(cadenceRow)
+
+        fprintf('\nAvailable ANOVA terms:\n');
+        disp(terms);
+
+        error( ...
+            'The Cadence term was not found in the ANOVA output.');
+    end
+
+    %% ---------------- Find result columns ------------------------------
+    fColumn = find_column_name( ...
+        variableNames, ...
+        {'FStat', 'F'});
+
+    df1Column = find_column_name( ...
+        variableNames, ...
+        {'DF1', 'NumDF'});
+
+    df2Column = find_column_name( ...
+        variableNames, ...
+        {'DF2', 'DenDF'});
+
+    pColumn = find_column_name( ...
+        variableNames, ...
+        {'pValue', 'PValue', 'p'});
+
+    if isempty(fColumn)
+        error('The F-statistic column was not found.');
+    end
+
+    if isempty(df1Column)
+        error('The numerator-df column was not found.');
+    end
+
+    if isempty(df2Column)
+        error('The denominator-df column was not found.');
+    end
+
+    if isempty(pColumn)
+        error('The p-value column was not found.');
+    end
+
+    Fvalue = extract_numeric_value( ...
+        aovResult, ...
+        cadenceRow, ...
+        fColumn);
+
+    df1 = extract_numeric_value( ...
+        aovResult, ...
+        cadenceRow, ...
+        df1Column);
+
+    df2 = extract_numeric_value( ...
+        aovResult, ...
+        cadenceRow, ...
+        df2Column);
+
+    pValue = extract_numeric_value( ...
+        aovResult, ...
+        cadenceRow, ...
+        pColumn);
+end
+
+
+%% =======================================================================
+function columnName = find_column_name( ...
+    variableNames, candidateNames)
+% FIND_COLUMN_NAME
+% Find a column using case-insensitive matching.
+
+    columnName = '';
+
+    for k = 1:numel(candidateNames)
+
+        idx = find( ...
+            strcmpi(variableNames, candidateNames{k}), ...
+            1);
+
+        if ~isempty(idx)
+
+            columnName = variableNames{idx};
+            return;
+        end
+    end
+end
+
+
+%% =======================================================================
+function value = extract_numeric_value( ...
+    aovResult, rowIndex, variableName)
+% EXTRACT_NUMERIC_VALUE
+% Extract one numeric value from a table or dataset column.
+
+    columnData = aovResult.(variableName);
+
+    if iscell(columnData)
+
+        value = columnData{rowIndex};
+
+    else
+
+        value = columnData(rowIndex);
+    end
+
+    if isnumeric(value)
+
+        value = double(value);
+
+    else
+
+        value = str2double(string(value));
+    end
+
+    value = value(1);
+end
+
+
+%% =======================================================================
+function adjustedP = benjamini_hochberg(rawP, familySize)
+% BENJAMINI_HOCHBERG
+% Apply the Benjamini-Hochberg FDR correction.
+
+    rawP = double(rawP(:));
+
+    adjustedP = nan(size(rawP));
+
+    validMask = isfinite(rawP);
+
+    if ~any(validMask)
+        return;
+    end
+
+    validIndices = find(validMask);
+    validP       = rawP(validMask);
+
+    [sortedP, sortOrder] = sort( ...
+        validP, ...
+        'ascend');
+
+    numberValid = numel(sortedP);
+    ranks       = (1:numberValid).';
+
+    sortedAdjusted = ...
+        sortedP .* familySize ./ ranks;
+
+    % Enforce monotonicity of the adjusted p-values
+    sortedAdjusted = ...
+        flipud(cummin(flipud(sortedAdjusted)));
+
+    sortedAdjusted = min(sortedAdjusted, 1);
+
+    restored = nan(numberValid, 1);
+    restored(sortOrder) = sortedAdjusted;
+
+    adjustedP(validIndices) = restored;
+end
+
+
+%% =======================================================================
+function symbol = significance_symbol(pValue)
+% SIGNIFICANCE_SYMBOL
+% Significance indicator based on the BH-FDR-adjusted p-value.
+
+    if ~isfinite(pValue)
+
+        symbol = 'NA';
+
+    elseif pValue < 0.0001
+
+        symbol = '****';
+
+    elseif pValue < 0.001
+
+        symbol = '***';
+
+    elseif pValue < 0.01
+
+        symbol = '**';
+
+    elseif pValue < 0.05
+
+        symbol = '*';
+
+    else
+
+        symbol = 'ns';
+    end
+end
+
+
+%% =======================================================================
+function txt = format_pvalue(pValue)
+% FORMAT_PVALUE
+% Format BH-FDR-adjusted p-values for display in the figure.
+%
+% Values smaller than 0.001 are displayed as:
+%   < 0.001
+%
+% Values greater than or equal to 0.001 are displayed to three decimal
+% places.
+
+    if ~isfinite(pValue)
+
+        txt = '= NA';
+
+    elseif pValue < 0.001
+
+        txt = '< 0.001';
+
+    else
+
+        txt = sprintf('= %.3f', pValue);
+    end
+end
