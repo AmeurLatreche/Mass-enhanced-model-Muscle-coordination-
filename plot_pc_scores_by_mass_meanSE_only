@@ -1,144 +1,1027 @@
-function plot_pc_scores_by_mass_meanSE_only(pcaMatFile, pcList)
+function [fig, statsTable] = plot_pc_scores_by_mass_meanSE_only(pcaMatFile, pcList)
 % PLOT_PC_SCORES_BY_MASS_MEANSE_ONLY
-%   PC scores vs mass (pooled across all cadences):
-%     - outliers removed within each mass group
-%     - plot mean ± SE only
-%    
 %
+% PC scores versus mass, pooled across all cadence conditions:
+%   - outliers removed within each mass condition
+%   - mean +/- SE only
+%   - significance indicator added to each panel
+%   - BH-FDR-adjusted p-value added to each panel
+%   - partial eta squared and Cohen's f added to each panel
+%
+% Very small adjusted p-values are displayed in the figure as:
+%   p_FDR < 0.001
+%
+% Exact raw and adjusted p-values remain available in statsTable.
+%
+% Statistical model:
+%   PC score ~ Mass + Cadence + (1|Participant)
+%
+% Mass is treated as a categorical condition.
+%
+% BH-FDR correction is performed across the first 25 PCs.
+%
+% Usage:
+%   plot_pc_scores_by_mass_meanSE_only;
+%
+%   [fig, statsTable] = plot_pc_scores_by_mass_meanSE_only( ...
+%       'E:\Tashih\TDC Data\PCA_outputs.mat', 1:12);
 
-
-    % ------------------- Defaults ---------------------------------------
+    %% ----------------------- Defaults ----------------------------------
     if nargin < 1 || isempty(pcaMatFile)
         pcaMatFile = 'E:\Tashih\TDC Data\PCA_outputs.mat';
     end
+
     if nargin < 2 || isempty(pcList)
         pcList = 1:12;
     end
-    pcList = pcList(:).';
 
-    % ------------------- Load PCA outputs -------------------------------
+    pcList = unique(pcList(:).', 'stable');
+
+    % Number of PC tests included in the BH-FDR correction
+    requestedFDRTests = 25;
+
+    % Fixed PC-score limits
+    fixedYLim = [-3, 3];
+
+    %% ----------------------- Load data ---------------------------------
     if ~isfile(pcaMatFile)
-        error('PCA file not found: %s', pcaMatFile);
+        error('PCA file not found:\n%s', pcaMatFile);
     end
 
     S = load(pcaMatFile, 'Score_all', 'Sample');
-    if ~isfield(S,'Score_all') || ~isfield(S,'Sample')
-        error('PCA file must contain Score_all and Sample.');
+
+    if ~isfield(S, 'Score_all') || ~isfield(S, 'Sample')
+        error('The PCA file must contain Score_all and Sample.');
     end
 
-    Score_all = S.Score_all;
+    Score_all = double(S.Score_all);
     Sample    = S.Sample;
 
-    if isa(Sample,'dataset')
+    if isa(Sample, 'dataset')
         Sample = dataset2table(Sample);
+
     elseif isstruct(Sample)
         Sample = struct2table(Sample);
     end
 
-    if ~istable(Sample) || ~ismember('massNum', Sample.Properties.VariableNames)
-        error('Sample must contain a "massNum" column.');
+    if ~istable(Sample)
+        error('Sample must be a MATLAB table, dataset, or structure.');
     end
 
-    massNum = double(Sample.massNum(:));
-
-    % ------------------- Mass order -------------------------------------
-    massLevels = unique(massNum(isfinite(massNum)));
-    massLevels = sort(massLevels(:).');
-    if numel(massLevels) < 2
-        error('Not enough distinct mass levels found in Sample.massNum.');
+    if size(Score_all, 1) ~= height(Sample)
+        error([ ...
+            'Score_all contains %d rows, but Sample contains ' ...
+            '%d rows.'], ...
+            size(Score_all, 1), ...
+            height(Sample));
     end
 
-    massLabels = arrayfun(@(x) sprintf('%g', x), massLevels, 'UniformOutput', false);
+    nAvailablePCs = size(Score_all, 2);
 
-    % ------------------- Keep valid rows --------------------------------
-    inMass = ismember(massNum, massLevels);
-    goodM  = isfinite(massNum);
+    if any(pcList < 1) || any(pcList > nAvailablePCs)
+        error('Score_all contains only %d PCs.', nAvailablePCs);
+    end
 
-    pcMask = true(size(Score_all,1),1);
-    for j = 1:numel(pcList)
-        pcj = pcList(j);
-        if pcj > size(Score_all,2)
-            error('Requested PC%d but only %d PCs available in Score_all.', ...
-                  pcj, size(Score_all,2));
+    %% ---------------- Required Sample variables ------------------------
+    requiredVariables = {'massNum', 'cadence', 'subj'};
+
+    for k = 1:numel(requiredVariables)
+
+        if ~ismember( ...
+                requiredVariables{k}, ...
+                Sample.Properties.VariableNames)
+
+            error( ...
+                'Sample does not contain the variable "%s".', ...
+                requiredVariables{k});
         end
-        pcMask = pcMask & isfinite(Score_all(:,pcj));
     end
 
-    keep = inMass & goodM & pcMask;
-    if ~any(keep)
-        error('No valid rows found for mass conditions in %s.', pcaMatFile);
+    massNum = convert_numeric_variable( ...
+        Sample.massNum, ...
+        'massNum');
+
+    cadenceCat = convert_categorical_variable( ...
+        Sample.cadence);
+
+    subjectCat = convert_categorical_variable( ...
+        Sample.subj);
+
+    %% ----------------------- Valid rows --------------------------------
+    baseValid = ...
+        isfinite(massNum) & ...
+        ~ismissing(cadenceCat) & ...
+        ~ismissing(subjectCat);
+
+    if ~any(baseValid)
+        error([ ...
+            'No valid mass, cadence, and participant rows ' ...
+            'were found.']);
     end
 
-    massNum_keep = massNum(keep);
-    scoresKeep   = Score_all(keep, pcList);
+    validSubjects = removecats(subjectCat(baseValid));
 
-    % ------------------- Plot layout ------------------------------------
+    if numel(categories(validSubjects)) < 2
+        error('At least two participants are required.');
+    end
+
+    %% ----------------------- Mass levels -------------------------------
+    massLevels = unique(massNum(baseValid));
+    massLevels = sort(massLevels(:).');
+
+    if numel(massLevels) < 2
+        error('At least two mass-scaled conditions are required.');
+    end
+
+    massLabels = arrayfun( ...
+        @(x) sprintf('%g', x), ...
+        massLevels, ...
+        'UniformOutput', false);
+
+    %% ---------------- Statistical analysis -----------------------------
+    nFDRTests = min(requestedFDRTests, nAvailablePCs);
+
+    if nAvailablePCs < requestedFDRTests
+        warning([ ...
+            'Only %d PCs are available. BH-FDR correction will be ' ...
+            'performed across %d tests instead of 25.'], ...
+            nAvailablePCs, ...
+            nFDRTests);
+    end
+
+    % Analyse the first 25 PCs and any additionally requested PCs
+    analysisPCs = unique( ...
+        [1:nFDRTests, pcList], ...
+        'stable');
+
+    pRaw       = nan(nAvailablePCs, 1);
+    pFDR       = nan(nAvailablePCs, 1);
+    etaPartial = nan(nAvailablePCs, 1);
+    cohenF     = nan(nAvailablePCs, 1);
+
+    for pcIdx = analysisPCs
+
+        y = Score_all(:, pcIdx);
+
+        % Remove outliers separately within each mass condition
+        keepPC = get_clean_pc_mask( ...
+            y, ...
+            massNum, ...
+            massLevels, ...
+            baseValid);
+
+        if sum(keepPC) < 5
+            warning( ...
+                'PC%d has too few valid observations.', ...
+                pcIdx);
+            continue;
+        end
+
+        try
+            % Create categorical mass condition
+            massCondition = categorical( ...
+                massNum(keepPC), ...
+                massLevels, ...
+                massLabels, ...
+                'Ordinal', false);
+
+            T = table( ...
+                y(keepPC), ...
+                removecats(massCondition), ...
+                removecats(cadenceCat(keepPC)), ...
+                removecats(subjectCat(keepPC)), ...
+                'VariableNames', { ...
+                    'Y', ...
+                    'Mass', ...
+                    'Cadence', ...
+                    'Subject'});
+
+            if numel(categories(T.Mass)) < 2
+                error('Fewer than two mass conditions remain.');
+            end
+
+            if numel(categories(T.Cadence)) > 1
+                formula = ...
+                    'Y ~ Mass + Cadence + (1|Subject)';
+            else
+                formula = ...
+                    'Y ~ Mass + (1|Subject)';
+            end
+
+            lme = fitlme( ...
+                T, ...
+                formula, ...
+                'FitMethod', 'REML');
+
+            % Use Satterthwaite degrees of freedom when supported
+            try
+                aovResult = anova( ...
+                    lme, ...
+                    'DFMethod', 'satterthwaite');
+
+            catch
+                aovResult = anova(lme);
+            end
+
+            % Compatible with both table and legacy dataset outputs
+            [Fvalue, df1, df2, pValue] = ...
+                extract_mass_statistics(aovResult);
+
+            pRaw(pcIdx) = pValue;
+
+            % Partial eta squared
+            etaValue = ...
+                (Fvalue * df1) / ...
+                ((Fvalue * df1) + df2);
+
+            etaValue = min(max(etaValue, 0), 1);
+
+            etaPartial(pcIdx) = etaValue;
+
+            % Cohen's f
+            if etaValue < 1
+
+                cohenF(pcIdx) = ...
+                    sqrt(etaValue / (1 - etaValue));
+
+            else
+
+                cohenF(pcIdx) = Inf;
+            end
+
+        catch ME
+
+            warning( ...
+                'Statistical analysis failed for PC%d:\n%s', ...
+                pcIdx, ...
+                ME.message);
+        end
+    end
+
+    %% ---------------- BH-FDR correction --------------------------------
+    pFDR(1:nFDRTests) = benjamini_hochberg( ...
+        pRaw(1:nFDRTests), ...
+        nFDRTests);
+
+    %% ---------------- Statistics output table --------------------------
+    PC = (1:nFDRTests).';
+
+    Significance = cell(nFDRTests, 1);
+
+    for k = 1:nFDRTests
+        Significance{k} = significance_symbol(pFDR(k));
+    end
+
+    statsTable = table( ...
+        PC, ...
+        pRaw(1:nFDRTests), ...
+        pFDR(1:nFDRTests), ...
+        etaPartial(1:nFDRTests), ...
+        cohenF(1:nFDRTests), ...
+        Significance, ...
+        'VariableNames', { ...
+            'PC', ...
+            'p_raw', ...
+            'p_FDR', ...
+            'PartialEtaSquared', ...
+            'CohenF', ...
+            'Significance'});
+
+    fprintf('\nFigure 3 mass-condition statistical results:\n');
+
+    rowsShown = ismember(statsTable.PC, pcList);
+    disp(statsTable(rowsShown, :));
+
+    %% ----------------------- Plot layout -------------------------------
     nPC   = numel(pcList);
     nCols = min(3, nPC);
     nRows = ceil(nPC / nCols);
 
-    fig = figure('Name','PC scores vs mass (mean ± SE only)','Color','w');
-    set(fig,'Units','centimeters','Position',[5 5 26 10]);
+    figureHeight = max(10, 5 * nRows);
 
-    tl = tiledlayout(nRows, nCols, 'TileSpacing','compact', 'Padding','compact');
-    title(tl, 'PC scores by mass (mean \pm SE)', 'FontSize', 13);
+    fig = figure( ...
+        'Name', 'PC scores vs mass condition (mean ± SE only)', ...
+        'Color', 'w');
+
+    set( ...
+        fig, ...
+        'Units', 'centimeters', ...
+        'Position', [5, 5, 26, figureHeight]);
+
+    tl = tiledlayout( ...
+        nRows, ...
+        nCols, ...
+        'TileSpacing', 'compact', ...
+        'Padding', 'compact');
+
+    % Overall figure title, matching the cadence figure format
+    title( ...
+        tl, ...
+        'PC scores by mass condition (mean \pm SE)', ...
+        'FontSize', 13);
 
     baseFont = 11;
+    xPos     = 1:numel(massLevels);
 
-    % ------------------- Plot each PC -----------------------------------
+    %% ----------------------- Plot each PC ------------------------------
     for i = 1:nPC
+
         pcIdx = pcList(i);
-        y     = scoresKeep(:, i);
+        y     = Score_all(:, pcIdx);
 
-        outFlag = false(size(y));
-        for c = 1:numel(massLevels)
-            idx = (massNum_keep == massLevels(c));
-            xi  = y(idx);
-            if numel(xi) >= 4
-                outFlag(idx) = isoutlier(xi, 'quartiles');
-            end
-        end
+        % Remove outliers within each mass condition
+        keepPC = get_clean_pc_mask( ...
+            y, ...
+            massNum, ...
+            massLevels, ...
+            baseValid);
 
-        yC    = y(~outFlag);
-        mNumC = massNum_keep(~outFlag);
+        yClean    = y(keepPC);
+        massClean = massNum(keepPC);
 
+        % Mean and SE pooled across cadence conditions
         mu = nan(1, numel(massLevels));
         se = nan(1, numel(massLevels));
 
         for c = 1:numel(massLevels)
-            xi = yC(mNumC == massLevels(c));
+
+            xi = yClean( ...
+                massClean == massLevels(c));
+
+            xi = xi(isfinite(xi));
+
             if ~isempty(xi)
+
                 mu(c) = mean(xi, 'omitnan');
-                se(c) = std(xi, 0, 'omitnan') / sqrt(sum(isfinite(xi)));
+
+                if numel(xi) > 1
+
+                    se(c) = ...
+                        std(xi, 0, 'omitnan') / ...
+                        sqrt(numel(xi));
+
+                else
+
+                    se(c) = 0;
+                end
             end
         end
 
-        nexttile;
-        hold on;
+        ax = nexttile;
+        hold(ax, 'on');
 
-        xPos = 1:numel(massLevels);
-
-        errorbar(xPos, mu, se, 'o-', ...
+        errorbar( ...
+            ax, ...
+            xPos, ...
+            mu, ...
+            se, ...
+            'o-', ...
             'LineWidth', 1.4, ...
             'MarkerSize', 5, ...
             'MarkerFaceColor', 'k', ...
-            'Color', 'k');
+            'MarkerEdgeColor', 'k', ...
+            'Color', 'k', ...
+            'CapSize', 7);
 
-        yline(0, 'k-', 'LineWidth', 1);
+        yline( ...
+            ax, ...
+            0, ...
+            'k-', ...
+            'LineWidth', 1);
 
-        xlim([0.5, numel(massLevels)+0.5]);
-        ylim([-3 3]);
-        xticks(xPos);
-        xticklabels(massLabels);
+        xlim( ...
+            ax, ...
+            [0.5, numel(massLevels) + 0.5]);
 
-        grid on;
-        box off;
-        set(gca, 'FontSize', baseFont);
+        ylim(ax, fixedYLim);
 
-        xlabel('Mass scaled condition');
-        ylabel(sprintf('PC%d score', pcIdx));
-        title(sprintf('PC%d by mass (mean \\pm SE)', pcIdx));
+        xticks(ax, xPos);
+        xticklabels(ax, massLabels);
 
-        hold off;
+        grid(ax, 'on');
+        box(ax, 'off');
+
+        set( ...
+            ax, ...
+            'FontSize', baseFont, ...
+            'Layer', 'top');
+
+        xlabel(ax, 'Mass condition');
+        ylabel(ax, sprintf('PC%d score', pcIdx));
+
+        %% -------- Significance indicator -------------------------------
+        if pcIdx <= nFDRTests
+
+            sigText = significance_symbol( ...
+                pFDR(pcIdx));
+
+        else
+
+            sigText = 'NA';
+        end
+
+        % Panel title matching the cadence-condition figure format
+        title( ...
+            ax, ...
+            sprintf( ...
+                'PC%d by mass condition (mean \\pm SE) %s', ...
+                pcIdx, ...
+                sigText));
+
+        %% -------- p-value and effect sizes -----------------------------
+        if pcIdx <= nFDRTests && isfinite(pFDR(pcIdx))
+
+            annotationText = sprintf([ ...
+                'p_{FDR} %s\n' ...
+                '\\eta_p^2 = %.3f; f = %.3f'], ...
+                format_pvalue(pFDR(pcIdx)), ...
+                etaPartial(pcIdx), ...
+                cohenF(pcIdx));
+
+        else
+
+            annotationText = ...
+                'Statistics unavailable';
+        end
+
+        text( ...
+            ax, ...
+            0.03, ...
+            0.96, ...
+            annotationText, ...
+            'Units', 'normalized', ...
+            'HorizontalAlignment', 'left', ...
+            'VerticalAlignment', 'top', ...
+            'FontSize', baseFont - 1, ...
+            'Interpreter', 'tex');
+
+        hold(ax, 'off');
     end
 end
+
+
+%% =======================================================================
+function x = convert_numeric_variable(xRaw, variableName)
+% CONVERT_NUMERIC_VARIABLE
+% Convert a table variable to a numeric column.
+
+    if isnumeric(xRaw) || islogical(xRaw)
+
+        x = double(xRaw(:));
+
+    elseif iscategorical(xRaw) || ...
+           isstring(xRaw) || ...
+           ischar(xRaw) || ...
+           iscell(xRaw)
+
+        x = str2double(string(xRaw(:)));
+
+    else
+
+        error( ...
+            'Variable "%s" cannot be converted to numeric.', ...
+            variableName);
+    end
+
+    if ~any(isfinite(x))
+        error( ...
+            'Variable "%s" contains no finite values.', ...
+            variableName);
+    end
+end
+
+
+%% =======================================================================
+function xCat = convert_categorical_variable(xRaw)
+% CONVERT_CATEGORICAL_VARIABLE
+% Convert a table variable to categorical.
+
+    if iscategorical(xRaw)
+
+        xCat = xRaw(:);
+
+    elseif isnumeric(xRaw) || islogical(xRaw)
+
+        numericValues = double(xRaw(:));
+        textValues    = string(numericValues);
+
+        textValues(~isfinite(numericValues)) = missing;
+
+        xCat = categorical(textValues);
+
+    else
+
+        textValues = string(xRaw(:));
+
+        emptyMask = ...
+            ismissing(textValues) | ...
+            strlength(strtrim(textValues)) == 0;
+
+        textValues(emptyMask) = missing;
+
+        xCat = categorical(textValues);
+    end
+end
+
+
+%% =======================================================================
+function keepMask = get_clean_pc_mask( ...
+    y, massNum, massLevels, baseValid)
+% GET_CLEAN_PC_MASK
+% Remove outliers separately within each mass-scaled condition.
+
+    y = double(y(:));
+
+    outFlag = false(size(y));
+
+    for c = 1:numel(massLevels)
+
+        idx = ...
+            baseValid & ...
+            isfinite(y) & ...
+            massNum == massLevels(c);
+
+        rowNumbers = find(idx);
+        xi = y(idx);
+
+        if numel(xi) >= 4
+
+            localOutlier = isoutlier( ...
+                xi, ...
+                'quartiles');
+
+            outFlag(rowNumbers(localOutlier)) = true;
+        end
+    end
+
+    keepMask = ...
+        baseValid & ...
+        isfinite(y) & ...
+        ~outFlag;
+end
+
+
+%% =======================================================================
+function [Fvalue, df1, df2, pValue] = ...
+    extract_mass_statistics(aovResult)
+% EXTRACT_MASS_STATISTICS
+% Extract the omnibus Mass effect from anova(lme).
+%
+% Supports both:
+%   - modern table output
+%   - legacy dataset output
+
+    if isa(aovResult, 'dataset')
+        aovResult = dataset2table(aovResult);
+    end
+
+    if ~istable(aovResult)
+        error( ...
+            'Unsupported ANOVA output type: %s.', ...
+            class(aovResult));
+    end
+
+    variableNames = ...
+        aovResult.Properties.VariableNames;
+
+    %% ---------------- Find model terms ---------------------------------
+    termColumn = find_column( ...
+        variableNames, ...
+        {'Term'});
+
+    if ~isempty(termColumn)
+
+        terms = string(aovResult.(termColumn));
+
+    elseif ~isempty(aovResult.Properties.RowNames)
+
+        terms = string(aovResult.Properties.RowNames);
+
+    else
+
+        error( ...
+            'ANOVA output does not contain model-term names.');
+    end
+
+    terms = strtrim(terms(:));
+
+    massRow = find( ...
+        strcmpi(terms, 'Mass'), ...
+        1);
+
+    if isempty(massRow)
+
+        massRow = find( ...
+            contains(lower(terms), 'mass'), ...
+            1);
+    end
+
+    if isempty(massRow)
+
+        fprintf('\nAvailable ANOVA terms:\n');
+        disp(terms);
+
+        error( ...
+            'The Mass term was not found in the ANOVA output.');
+    end
+
+    %% ---------------- Find result columns ------------------------------
+    fColumn = find_column( ...
+        variableNames, ...
+        {'FStat', 'F'});
+
+    df1Column = find_column( ...
+        variableNames, ...
+        {'DF1', 'NumDF'});
+
+    df2Column = find_column( ...
+        variableNames, ...
+        {'DF2', 'DenDF'});
+
+    pColumn = find_column( ...
+        variableNames, ...
+        {'pValue', 'PValue', 'p'});
+
+    if isempty(fColumn)
+        error('The F-statistic column was not found.');
+    end
+
+    if isempty(df1Column)
+        error('The numerator-df column was not found.');
+    end
+
+    if isempty(df2Column)
+        error('The denominator-df column was not found.');
+    end
+
+    if isempty(pColumn)
+        error('The p-value column was not found.');
+    end
+
+    Fvalue = extract_numeric_value( ...
+        aovResult, ...
+        massRow, ...
+        fColumn);
+
+    df1 = extract_numeric_value( ...
+        aovResult, ...
+        massRow, ...
+        df1Column);
+
+    df2 = extract_numeric_value( ...
+        aovResult, ...
+        massRow, ...
+        df2Column);
+
+    pValue = extract_numeric_value( ...
+        aovResult, ...
+        massRow, ...
+        pColumn);
+end
+
+
+%% =======================================================================
+function columnName = find_column(variableNames, candidateNames)
+% FIND_COLUMN
+% Find a table column using case-insensitive matching.
+
+    columnName = '';
+
+    for k = 1:numel(candidateNames)
+
+        idx = find( ...
+            strcmpi(variableNames, candidateNames{k}), ...
+            1);
+
+        if ~isempty(idx)
+            columnName = variableNames{idx};
+            return;
+        end
+    end
+end
+
+
+%% =======================================================================
+function value = extract_numeric_value(T, rowIndex, variableName)
+% EXTRACT_NUMERIC_VALUE
+% Extract one numerical value from an ANOVA table column.
+
+    columnData = T.(variableName);
+
+    if iscell(columnData)
+
+        value = columnData{rowIndex};
+
+    else
+
+        value = columnData(rowIndex);
+    end
+
+    if isnumeric(value)
+
+        value = double(value);
+
+    else
+
+        value = str2double(string(value));
+    end
+
+    value = value(1);
+end
+
+
+%% =======================================================================
+function adjustedP = benjamini_hochberg(rawP, familySize)
+% BENJAMINI_HOCHBERG
+% Apply the Benjamini-Hochberg false-discovery-rate correction.
+
+    rawP = double(rawP(:));
+
+    adjustedP = nan(size(rawP));
+
+    validMask = isfinite(rawP);
+
+    if ~any(validMask)
+        return;
+    end
+
+    validIndices = find(validMask);
+    validP       = rawP(validMask);
+
+    [sortedP, sortOrder] = sort( ...
+        validP, ...
+        'ascend');
+
+    numberValid = numel(sortedP);
+    ranks       = (1:numberValid).';
+
+    sortedAdjusted = ...
+        sortedP .* familySize ./ ranks;
+
+    % Enforce monotonicity of adjusted p-values
+    sortedAdjusted = ...
+        flipud(cummin(flipud(sortedAdjusted)));
+
+    sortedAdjusted = min(sortedAdjusted, 1);
+
+    restored = nan(numberValid, 1);
+    restored(sortOrder) = sortedAdjusted;
+
+    adjustedP(validIndices) = restored;
+end
+
+
+%% =======================================================================
+function symbol = significance_symbol(pValue)
+% SIGNIFICANCE_SYMBOL
+% Significance indicator based on the BH-FDR-adjusted p-value.
+
+    if ~isfinite(pValue)
+
+        symbol = 'NA';
+
+    elseif pValue < 0.0001
+
+        symbol = '****';
+
+    elseif pValue < 0.001
+
+        symbol = '***';
+
+    elseif pValue < 0.01
+
+        symbol = '**';
+
+    elseif pValue < 0.05
+
+        symbol = '*';
+
+    else
+
+        symbol = 'ns';
+    end
+end
+
+
+%% =======================================================================
+function txt = format_pvalue(pValue)
+% FORMAT_PVALUE
+% Format BH-FDR-adjusted p-values for display in the figure.
+%
+% Values smaller than 0.001 are displayed as:
+%   < 0.001
+%
+% Values greater than or equal to 0.001 are displayed to three decimal
+% places. Exact values remain stored in statsTable.
+
+    if ~isfinite(pValue)
+
+        txt = '= NA';
+
+    elseif pValue < 0.001
+
+        txt = '< 0.001';
+
+    else
+
+        txt = sprintf('= %.3f', pValue);
+    end
+end
+
+
+
+
+% function plot_pc_scores_by_mass(pcaMatFile, pcList)
+% % PLOT_PC_SCORES_BY_MASS
+% %   PC scores vs mass (pooled across all cadences):
+% %     - Boxplot after removing flagged outliers within each mass group
+% %     - Overlay mean ± SE computed on the same cleaned data
+% %     - Each PC keeps its own y-axis scale
+% %
+% % Usage:
+% %   plot_pc_scores_by_mass;
+% %   plot_pc_scores_by_mass('C:\Ameur Results\Selected\PCA_outputs.mat', 1:5);
+% 
+%     % ------------------- Defaults ---------------------------------------
+%     if nargin < 1 || isempty(pcaMatFile)
+%         % pcaMatFile = 'C:\Ameur Results\Selected\PCA_outputs.mat';
+%         pcaMatFile = 'C:\Baklawa\Baklaaaaaaaaaaaaaaaaaaawaa\TDC Data\PCA_outputs.mat';
+%     end
+%     if nargin < 2 || isempty(pcList)
+%         pcList = 1:12;
+%     end
+%     pcList = pcList(:).';
+% 
+%     % ------------------- Load PCA outputs -------------------------------
+%     if ~isfile(pcaMatFile)
+%         error('PCA file not found: %s', pcaMatFile);
+%     end
+% 
+%     S = load(pcaMatFile, 'Score_all', 'Sample');
+%     if ~isfield(S,'Score_all') || ~isfield(S,'Sample')
+%         error('PCA file must contain Score_all and Sample.');
+%     end
+% 
+%     Score_all = S.Score_all;
+%     Sample    = S.Sample;
+% 
+%     % Ensure Sample is a table
+%     if isa(Sample,'dataset')
+%         Sample = dataset2table(Sample);
+%     elseif isstruct(Sample)
+%         Sample = struct2table(Sample);
+%     end
+%     if ~istable(Sample) || ~ismember('massNum', Sample.Properties.VariableNames)
+%         error('Sample must contain a "massNum" column.');
+%     end
+% 
+%     % Mass as numeric
+%     massNum = double(Sample.massNum(:));
+% 
+%     % ------------------- Mass order -------------------------------------
+%     massLevels = unique(massNum(isfinite(massNum)));
+%     massLevels = sort(massLevels(:).');   % row vector ascending
+% 
+%     if numel(massLevels) < 2
+%         error('Not enough distinct mass levels found in Sample.massNum.');
+%     end
+% 
+%     massLabels = arrayfun(@(x) sprintf('%g', x), massLevels, 'UniformOutput', false);
+%     massOrder  = string(massLabels);
+% 
+%     % ------------------- Highlight settings -----------------------------
+%     highlightMass  = "1";
+%     highlightColor = [0.85 0.33 0.10];
+%     highlightAlpha = 0.25;
+% 
+%     % ------------------- Keep valid rows --------------------------------
+%     inMass = ismember(massNum, massLevels);
+%     goodM  = isfinite(massNum);
+% 
+%     % Ensure PCs exist + are finite
+%     pcMask = true(size(Score_all,1),1);
+%     for j = 1:numel(pcList)
+%         pcj = pcList(j);
+%         if pcj > size(Score_all,2)
+%             error('Requested PC%d but only %d PCs available in Score_all.', ...
+%                   pcj, size(Score_all,2));
+%         end
+%         pcMask = pcMask & isfinite(Score_all(:,pcj));
+%     end
+% 
+%     keep = inMass & goodM & pcMask;
+%     if ~any(keep)
+%         error('No valid rows found for mass conditions in %s.', pcaMatFile);
+%     end
+% 
+%     massNum_keep = massNum(keep);
+%     massCatAll   = categorical(massNum_keep, massLevels, massLabels, 'Ordinal', true);
+%     scoresKeep   = Score_all(keep, pcList);
+% 
+%     % ------------------- Plot layout ------------------------------------
+%     nPC   = numel(pcList);
+%     nCols = min(3, nPC);
+%     nRows = ceil(nPC / nCols);
+% 
+%     fig = figure('Name','PC scores vs mass (cleaned outliers)','Color','w');
+%     set(fig,'Units','centimeters','Position',[5 5 26 10]);
+% 
+%     tl = tiledlayout(nRows, nCols, 'TileSpacing','compact', 'Padding','compact');
+%     title(tl, 'PC scores by mass (mean \pm SE)', 'FontSize', 13);
+% 
+%     baseFont = 11;
+%     whiskerValue = 1.5;   % changed from Inf to reduce whisker length
+% 
+%     % ------------------- Plot each PC -----------------------------------
+%     for i = 1:nPC
+%         pcIdx = pcList(i);
+% 
+%         y  = scoresKeep(:, i);
+%         mc = massCatAll;
+% 
+%         % ----- Flag outliers within each mass group ---------------------
+%         outFlag = false(size(y));
+%         for c = 1:numel(massLevels)
+%             idx = (mc == massOrder(c));
+%             xi  = y(idx);
+%             if numel(xi) >= 4
+%                 outFlag(idx) = isoutlier(xi, 'quartiles');
+%             else
+%                 outFlag(idx) = false(size(xi));
+%             end
+%         end
+% 
+%         % Cleaned
+%         yC  = y(~outFlag);
+%         mcC = mc(~outFlag);
+% 
+%         nexttile;
+%         hold on;
+% 
+%         % Boxplot on cleaned data
+%         boxplot(yC, mcC, ...
+%                 'Whisker', whiskerValue, ...
+%                 'Symbol', '', ...
+%                 'GroupOrder', cellstr(massOrder));
+% 
+%         % ---- Highlight one mass box ------------------------------------
+%         hiPos = find(massOrder == highlightMass, 1, 'first');
+%         if ~isempty(hiPos)
+%             boxes = findobj(gca, 'Tag', 'Box');
+%             for b = 1:numel(boxes)
+%                 xd = get(boxes(b), 'XData');
+%                 yd = get(boxes(b), 'YData');
+%                 xCenter = mean(xd);
+% 
+%                 if abs(xCenter - hiPos) < 0.2
+%                     patch(xd, yd, highlightColor, ...
+%                           'FaceAlpha', highlightAlpha, ...
+%                           'EdgeColor', highlightColor, ...
+%                           'LineWidth', 1.4);
+%                     set(boxes(b), 'Color', highlightColor, 'LineWidth', 1.4);
+%                 end
+%             end
+% 
+%             meds = findobj(gca, 'Tag', 'Median');
+%             for m = 1:numel(meds)
+%                 xd = get(meds(m), 'XData');
+%                 if abs(mean(xd) - hiPos) < 0.2
+%                     set(meds(m), 'Color', highlightColor, 'LineWidth', 1.6);
+%                 end
+%             end
+%         end
+% 
+%         % Mean ± SE aligned to fixed mass order
+%         mu = nan(1, numel(massLevels));
+%         se = nan(1, numel(massLevels));
+%         for c = 1:numel(massLevels)
+%             xi = yC(mcC == massOrder(c));
+%             if ~isempty(xi)
+%                 mu(c) = mean(xi, 'omitnan');
+%                 se(c) = std(xi, 0, 'omitnan') / sqrt(sum(isfinite(xi)));
+%             end
+%         end
+% 
+%         xPos = 1:numel(massLevels);
+%         errorbar(xPos, mu, se, 'ko', ...
+%             'LineWidth', 1.3, ...
+%             'MarkerFaceColor', 'k', ...
+%             'MarkerSize', 4);
+% 
+%         yline(0, 'k-', 'LineWidth', 1);
+% 
+%         grid on;
+%         box off;
+%         set(gca, 'FontSize', baseFont);
+% 
+%         xlabel('Mass scaled condition');
+%         ylabel(sprintf('PC%d score', pcIdx));
+%         title(sprintf('PC%d by mass (mean \\pm SE)', pcIdx));
+% 
+%         % Keep each PC with its own scale
+%         xlim([0.5, numel(massLevels)+0.5]);
+%         ylim('auto');
+% 
+%         hold off;
+%     end
+% end
